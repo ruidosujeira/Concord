@@ -1,9 +1,31 @@
 {
   "summary": {
     "changed": 0,
-    "errors": 1
+    "errors": 1,
+    "warnings": 1
   },
   "diagnostics": [
+    {
+      "category": "lint/suspicious/noConsole",
+      "severity": "warning",
+      "description": "Unexpected console statement.",
+      "location": {
+        "path": {
+          "file": "/project/src/app.ts"
+        },
+        "start": {
+          "line": 1,
+          "column": 7
+        },
+        "end": {
+          "line": 1,
+          "column": 14
+        }
+      },
+      "futureField": {
+        "mayBeAddedByBiome": true
+      }
+    },
     {
       "category": "lint/suspicious/noDebugger",
       "severity": "error",
@@ -12,8 +34,14 @@
         "path": {
           "file": "/project/src/app.ts"
         },
-        "span": [19, 27],
-        "sourceCode": "function run() {\n  debugger;\n}\n"
+        "start": {
+          "line": 1,
+          "column": 1
+        },
+        "end": {
+          "line": 1,
+          "column": 9
+        }
       },
       "futureField": true
     }
