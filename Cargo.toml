@@ -1,11 +1,13 @@
 [package]
 name = "concord"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Compare JavaScript and TypeScript linters and formatters"
 license = "MIT"
-repository = "https://github.com/rosmano/concord"
+repository = "https://github.com/ruidosujeira/Concord"
+homepage = "https://github.com/ruidosujeira/Concord"
+readme = "README.md"
 default-run = "concord"
 
 [features]

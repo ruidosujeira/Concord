@@ -51,6 +51,24 @@ fn fake_eslint() -> ExitCode {
                 "endColumn": column + 8
             }));
         }
+        for (needle, variable) in [
+            ("catch (error)", "error"),
+            ("userTryingToGet", "userTryingToGet"),
+        ] {
+            if let Some((line, column)) = locate(&source, needle) {
+                found = true;
+                let width = u32::try_from(needle.len()).unwrap_or(u32::MAX);
+                messages.push(serde_json::json!({
+                    "ruleId": "no-unused-vars",
+                    "severity": 1,
+                    "message": format!("This variable {variable} is unused."),
+                    "line": line,
+                    "column": column,
+                    "endLine": line,
+                    "endColumn": column.saturating_add(width)
+                }));
+            }
+        }
         reports.push(serde_json::json!({
             "filePath": absolute(&path),
             "messages": messages,

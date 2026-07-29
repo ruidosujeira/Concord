@@ -76,6 +76,7 @@ impl std::str::FromStr for Tool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
+    Unknown,
     Info,
     Warning,
     Error,
@@ -98,7 +99,8 @@ impl Severity {
         {
             "fatal" | "error" | "2" => Self::Error,
             "warn" | "warning" | "1" => Self::Warning,
-            _ => Self::Info,
+            "info" | "information" | "0" => Self::Info,
+            _ => Self::Unknown,
         }
     }
 }

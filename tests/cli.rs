@@ -238,6 +238,49 @@ fn reducer_minimizes_a_formatter_fixture() {
 }
 
 #[test]
+fn lint_reducer_preserves_the_selected_diagnostic_identity() {
+    let directory = project_with_tools(&["eslint", "biome"]);
+    let source = r#"try {
+    execute();
+} catch (error) {
+    console.log("failed");
+}
+
+const userTryingToGet = getUser();
+"#;
+    let source_path = directory.path().join("drift.ts");
+    fs::write(&source_path, source).expect("source");
+    let output = run(
+        directory.path(),
+        &[
+            "reduce",
+            "--mode",
+            "lint",
+            "--baseline",
+            "eslint",
+            "--candidate",
+            "biome",
+            "--mismatch",
+            "0",
+            "--output",
+            "result.ts",
+            "--no-save-report",
+            "drift.ts",
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reduced = fs::read_to_string(directory.path().join("result.ts")).expect("reduced");
+    assert!(reduced.contains("catch (error)"));
+    assert!(!reduced.contains("userTryingToGet"));
+    assert_eq!(fs::read_to_string(source_path).expect("original"), source);
+}
+
+#[test]
 fn usage_error_returns_two() {
     let directory = project_with_tools(&["eslint"]);
     fs::write(directory.path().join("case.ts"), "").expect("source");

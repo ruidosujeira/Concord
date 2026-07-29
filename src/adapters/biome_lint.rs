@@ -12,16 +12,12 @@ pub fn parse(
     aliases: &AliasTable,
 ) -> std::result::Result<ParsedDiagnostics, String> {
     if source.trim().is_empty() {
-        return Ok(ParsedDiagnostics {
-            diagnostics: Vec::new(),
-            warnings: vec!["Biome produced empty JSON output".into()],
-        });
+        return Err("Biome produced empty structured JSON output".into());
     }
-    let values = parse_json_or_rdjson(source)?;
+    let value: Value = serde_json::from_str(source)
+        .map_err(|error| format!("failed to parse Biome structured JSON: {error}"))?;
     let mut raw_diagnostics = Vec::new();
-    for value in &values {
-        collect_diagnostics(value, &mut raw_diagnostics);
-    }
+    collect_diagnostics(&value, &mut raw_diagnostics);
     let diagnostics = raw_diagnostics
         .into_iter()
         .map(|value| convert(value, root, aliases))
@@ -30,17 +26,6 @@ pub fn parse(
         diagnostics,
         warnings: Vec::new(),
     })
-}
-
-fn parse_json_or_rdjson(source: &str) -> std::result::Result<Vec<Value>, String> {
-    if let Ok(value) = serde_json::from_str(source) {
-        return Ok(vec![value]);
-    }
-    source
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).map_err(|error| error.to_string()))
-        .collect()
 }
 
 fn collect_diagnostics<'a>(value: &'a Value, output: &mut Vec<&'a Value>) {
@@ -99,14 +84,14 @@ fn convert(value: &Value, root: &Path, aliases: &AliasTable) -> Diagnostic {
 
 fn parse_span(value: &Value, source: Option<&str>) -> Option<Span> {
     if let Some(start) = value.pointer("/location/range/start") {
-        return structured_span(start, value.pointer("/location/range/end"), true);
+        return structured_span(start, value.pointer("/location/range/end"));
     }
     if let Some(start) = value.pointer("/location/start") {
-        return structured_span(start, value.pointer("/location/end"), false);
+        return structured_span(start, value.pointer("/location/end"));
     }
     if let Some(start) = value.pointer("/location/span/start") {
         if start.is_object() {
-            return structured_span(start, value.pointer("/location/span/end"), false);
+            return structured_span(start, value.pointer("/location/span/end"));
         }
     }
     let offsets = value.pointer("/location/span").and_then(Value::as_array);
@@ -127,20 +112,14 @@ fn parse_span(value: &Value, source: Option<&str>) -> Option<Span> {
     None
 }
 
-fn structured_span(start: &Value, end: Option<&Value>, zero_based: bool) -> Option<Span> {
-    let offset = u32::from(zero_based);
-    let start_line = find_number(start, &["line", "lineNumber"])? + offset;
-    let start_column =
-        find_number(start, &["column", "columnNumber"]).unwrap_or(1 - offset) + offset;
+fn structured_span(start: &Value, end: Option<&Value>) -> Option<Span> {
+    let start_line = find_number(start, &["line", "lineNumber"])?;
+    let start_column = find_number(start, &["column", "columnNumber"]).unwrap_or(1);
     Some(Span {
         start_line,
         start_column,
-        end_line: end
-            .and_then(|value| find_number(value, &["line", "lineNumber"]))
-            .map(|value| value + offset),
-        end_column: end
-            .and_then(|value| find_number(value, &["column", "columnNumber"]))
-            .map(|value| value + offset),
+        end_line: end.and_then(|value| find_number(value, &["line", "lineNumber"])),
+        end_column: end.and_then(|value| find_number(value, &["column", "columnNumber"])),
     })
 }
 
@@ -211,37 +190,57 @@ mod tests {
 
     use super::parse;
     use crate::matching::AliasTable;
+    use crate::model::Severity;
 
     #[test]
-    fn parses_biome_json_fixture() {
+    fn preserves_biome_severity_positions_and_additional_fields() {
         let source = include_str!("../../tests/fixtures/biome-output.json");
         let parsed =
             parse(source, Path::new("/project"), &AliasTable::default()).expect("Biome JSON");
-        assert_eq!(parsed.diagnostics.len(), 1);
-        assert_eq!(
-            parsed.diagnostics[0].canonical_code.as_deref(),
-            Some("no-debugger")
-        );
-        assert_eq!(
-            parsed.diagnostics[0]
-                .span
-                .as_ref()
-                .map(|span| span.start_line),
-            Some(2)
-        );
-    }
-
-    #[test]
-    fn parses_biome_rdjson_fixture() {
-        let source = include_str!("../../tests/fixtures/biome-output.rdjson");
-        let parsed =
-            parse(source, Path::new("/project"), &AliasTable::default()).expect("Biome RDJSON");
-        assert_eq!(parsed.diagnostics.len(), 1);
+        assert_eq!(parsed.diagnostics.len(), 2);
         assert_eq!(
             parsed.diagnostics[0].canonical_code.as_deref(),
             Some("no-console")
         );
+        assert_eq!(parsed.diagnostics[0].severity, Severity::Warning);
+        let warning_span = parsed.diagnostics[0].span.as_ref().expect("warning span");
+        assert_eq!((warning_span.start_line, warning_span.start_column), (1, 7));
+
+        assert_eq!(
+            parsed.diagnostics[1].canonical_code.as_deref(),
+            Some("no-debugger")
+        );
+        assert_eq!(parsed.diagnostics[1].severity, Severity::Error);
+        let error_span = parsed.diagnostics[1].span.as_ref().expect("error span");
+        assert_eq!((error_span.start_line, error_span.start_column), (1, 1));
+    }
+
+    #[test]
+    fn missing_severity_is_unknown_and_position_is_not_shifted() {
+        let source = include_str!("../../tests/fixtures/biome-output.rdjson");
+        let parsed =
+            parse(source, Path::new("/project"), &AliasTable::default()).expect("Biome JSON");
+        assert_eq!(parsed.diagnostics.len(), 1);
+        assert_eq!(parsed.diagnostics[0].severity, Severity::Unknown);
         let span = parsed.diagnostics[0].span.as_ref().expect("span");
-        assert_eq!((span.start_line, span.start_column), (4, 3));
+        assert_eq!((span.start_line, span.start_column), (1, 7));
+    }
+
+    #[test]
+    fn invalid_json_is_rejected_with_context() {
+        let error = parse(
+            "{\"diagnostics\": [",
+            Path::new("/project"),
+            &AliasTable::default(),
+        )
+        .expect_err("invalid JSON must fail");
+        assert!(error.contains("failed to parse Biome structured JSON"));
+    }
+
+    #[test]
+    fn empty_output_is_rejected() {
+        let error = parse("", Path::new("/project"), &AliasTable::default())
+            .expect_err("empty output must fail");
+        assert_eq!(error, "Biome produced empty structured JSON output");
     }
 }

@@ -297,7 +297,7 @@ fn lint_arguments(tool: Tool, root: &Path, files: &[PathBuf]) -> Vec<OsString> {
             .collect(),
         Tool::Biome => [
             "lint",
-            "--reporter=rdjson",
+            "--reporter=json",
             "--max-diagnostics=none",
             "--diagnostic-level=info",
             "--no-errors-on-unmatched",
@@ -382,5 +382,37 @@ fn normalized_eol(value: &str, enabled: bool) -> String {
         value.replace("\r\n", "\n")
     } else {
         value.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::lint_arguments;
+    use crate::model::Tool;
+
+    #[test]
+    fn biome_uses_structured_json_without_diagnostic_limit() {
+        let arguments = lint_arguments(Tool::Biome, Path::new("/project"), &[]);
+        let arguments: Vec<_> = arguments
+            .iter()
+            .map(|argument| argument.to_string_lossy())
+            .collect();
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument == "--reporter=json")
+        );
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument == "--max-diagnostics=none")
+        );
+        assert!(
+            arguments
+                .iter()
+                .all(|argument| argument != "--reporter=rdjson")
+        );
     }
 }

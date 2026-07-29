@@ -9,17 +9,16 @@
         "url": "https://biomejs.dev/linter/rules/no-console",
         "value": "lint/suspicious/noConsole"
       },
-      "severity": "warning",
       "location": {
         "path": "/project/src/app.ts",
         "range": {
           "start": {
-            "line": 3,
-            "column": 2
+            "line": 1,
+            "column": 7
           },
           "end": {
-            "line": 3,
-            "column": 9
+            "line": 1,
+            "column": 14
           }
         }
       },

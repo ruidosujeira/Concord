@@ -17,7 +17,18 @@ project's `node_modules/.bin`, falls back to `PATH`, and accepts explicit
 executable paths in `concord.toml`. Commands are executed directly, without a
 shell, and source files are never passed to a formatter with `--write`.
 
-## Install locally
+## Install
+
+Install the official tagged release:
+
+```bash
+cargo install \
+  --git https://github.com/ruidosujeira/Concord.git \
+  --tag v0.1.1 \
+  --locked
+```
+
+### Install locally
 
 Rust stable is required. From this repository:
 
@@ -194,6 +205,16 @@ The project is one modular crate:
 
 JSON reports use `schemaVersion: 1`. Their arrays are sorted independently of
 the order in which tools or worker threads return results.
+
+## Real-world validation
+
+Concord is tested with captured fixtures, pinned-tool smoke tests and
+real-world projects.
+
+The v0.1.1 validation against TabNews uncovered and fixed two correctness bugs:
+Biome diagnostic normalization and reducer target drift.
+
+[Read the TabNews validation report](docs/validation/tabnews-v0.1.1.md).
 
 ## Exit codes
 

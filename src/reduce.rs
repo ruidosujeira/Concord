@@ -12,7 +12,7 @@ use crate::adapters::{FormatterAdapter, compare_format_file, run_linter};
 use crate::config::Config;
 use crate::error::{ConcordError, Result};
 use crate::matching::{AliasTable, MatchKind, compare};
-use crate::model::Tool;
+use crate::model::{Diagnostic, Severity, Tool};
 use crate::process::ProcessRunner;
 use crate::report::FormatStatus;
 
@@ -40,6 +40,18 @@ pub struct MismatchSignature {
     pub side: String,
     pub category: String,
     pub canonical_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<DiagnosticSignature>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate: Option<DiagnosticSignature>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticSignature {
+    pub canonical_code: Option<String>,
+    pub message: String,
+    pub severity: Severity,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -133,6 +145,14 @@ pub fn reduce(root: &Path, config: &Config, request: ReductionRequest) -> Result
     fs::write(&output, &reduced).map_err(|error| {
         ConcordError::io("failed to write reduced reproduction", &output, error)
     })?;
+    let saved = fs::read_to_string(&output)
+        .map_err(|error| ConcordError::io("failed to read reduced reproduction", &output, error))?;
+    if !predicate.verify(&saved)? {
+        return Err(ConcordError::operational(format!(
+            "the saved reproduction no longer preserves the selected mismatch\noutput: {}",
+            output.display()
+        )));
+    }
     Ok(ReductionResult {
         schema_version: 1,
         mode: request.mode,
@@ -190,6 +210,8 @@ impl<'a> Predicate<'a> {
                 side: String::new(),
                 category: String::new(),
                 canonical_code: None,
+                baseline: None,
+                candidate: None,
             },
             baseline_formatter,
             candidate_formatter,
@@ -206,11 +228,18 @@ impl<'a> Predicate<'a> {
     }
 
     fn preserves(&self, content: &str) -> bool {
-        if fs::write(&self.temp_path, content).is_err() {
-            return false;
-        }
-        self.current_signatures()
-            .is_ok_and(|signatures| signatures.contains(&self.signature))
+        self.verify(content).unwrap_or(false)
+    }
+
+    fn verify(&self, content: &str) -> Result<bool> {
+        fs::write(&self.temp_path, content).map_err(|error| {
+            ConcordError::io(
+                "failed to write temporary reduction candidate",
+                &self.temp_path,
+                error,
+            )
+        })?;
+        Ok(self.current_signatures()?.contains(&self.signature))
     }
 
     fn current_signatures(&self) -> Result<Vec<MismatchSignature>> {
@@ -239,21 +268,13 @@ impl<'a> Predicate<'a> {
             result
                 .baseline_only
                 .into_iter()
-                .map(|diagnostic| MismatchSignature {
-                    side: "baseline".into(),
-                    category: "baseline_only".into(),
-                    canonical_code: diagnostic.canonical_code,
-                }),
+                .map(|diagnostic| unmatched_signature("baseline", diagnostic)),
         );
         signatures.extend(
             result
                 .candidate_only
                 .into_iter()
-                .map(|diagnostic| MismatchSignature {
-                    side: "candidate".into(),
-                    category: "candidate_only".into(),
-                    canonical_code: diagnostic.canonical_code,
-                }),
+                .map(|diagnostic| unmatched_signature("candidate", diagnostic)),
         );
         signatures.extend(
             result
@@ -266,7 +287,10 @@ impl<'a> Predicate<'a> {
                     canonical_code: item
                         .baseline
                         .canonical_code
-                        .or(item.candidate.canonical_code),
+                        .clone()
+                        .or(item.candidate.canonical_code.clone()),
+                    baseline: Some(diagnostic_signature(&item.baseline)),
+                    candidate: Some(diagnostic_signature(&item.candidate)),
                 }),
         );
         Ok(signatures)
@@ -311,7 +335,34 @@ impl<'a> Predicate<'a> {
             side: "both".into(),
             category: format_status_name(result.status).into(),
             canonical_code: None,
+            baseline: None,
+            candidate: None,
         }])
+    }
+}
+
+fn unmatched_signature(side: &str, diagnostic: Diagnostic) -> MismatchSignature {
+    let canonical_code = diagnostic.canonical_code.clone();
+    let identity = diagnostic_signature(&diagnostic);
+    let (baseline, candidate) = if side == "baseline" {
+        (Some(identity), None)
+    } else {
+        (None, Some(identity))
+    };
+    MismatchSignature {
+        side: side.into(),
+        category: format!("{side}_only"),
+        canonical_code,
+        baseline,
+        candidate,
+    }
+}
+
+fn diagnostic_signature(diagnostic: &Diagnostic) -> DiagnosticSignature {
+    DiagnosticSignature {
+        canonical_code: diagnostic.canonical_code.clone(),
+        message: diagnostic.message.clone(),
+        severity: diagnostic.severity,
     }
 }
 
@@ -445,7 +496,9 @@ fn format_status_name(status: FormatStatus) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{PredicateCache, delta_debug};
+    use crate::model::{Diagnostic, DiagnosticData, Severity, Tool};
+
+    use super::{PredicateCache, delta_debug, unmatched_signature};
 
     #[test]
     fn cache_does_not_repeat_predicate_calls() {
@@ -468,5 +521,32 @@ mod tests {
         let source = "one\ntwo\nKEEP\nthree\nfour\n";
         let reduced = delta_debug(source, &mut |candidate| candidate.contains("KEEP"));
         assert_eq!(reduced, "KEEP\n");
+    }
+
+    #[test]
+    fn mismatch_signature_rejects_another_diagnostic_with_the_same_rule() {
+        let diagnostic = |message: &str| {
+            Diagnostic::new(
+                Tool::Eslint,
+                "temporary.ts",
+                DiagnosticData {
+                    code: Some("no-unused-vars".into()),
+                    canonical_code: Some("no-unused-vars".into()),
+                    severity: Severity::Warning,
+                    message: message.into(),
+                    span: None,
+                    fix: None,
+                },
+            )
+        };
+        let selected =
+            unmatched_signature("baseline", diagnostic("This variable error is unused."));
+        let drifted = unmatched_signature(
+            "baseline",
+            diagnostic("This variable userTryingToGet is unused."),
+        );
+
+        assert_ne!(selected, drifted);
+        assert!(![drifted].contains(&selected));
     }
 }
