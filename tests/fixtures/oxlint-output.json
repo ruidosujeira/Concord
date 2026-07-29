@@ -1,0 +1,16 @@
+{
+  "diagnostics": [
+    {
+      "filename": "/project/src/app.ts",
+      "code": "eslint(no-debugger)",
+      "severity": "error",
+      "message": "Unexpected debugger statement.",
+      "line": 2,
+      "column": 3,
+      "endLine": 2,
+      "endColumn": 11,
+      "help": "Remove the statement."
+    }
+  ],
+  "number_of_files": 1
+}

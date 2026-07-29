@@ -1,0 +1,31 @@
+[
+  {
+    "filePath": "/project/src/app.ts",
+    "messages": [
+      {
+        "ruleId": "no-debugger",
+        "severity": 2,
+        "message": "Unexpected debugger statement.",
+        "line": 2,
+        "column": 3,
+        "endLine": 2,
+        "endColumn": 11,
+        "fix": {
+          "range": [18, 26],
+          "text": ""
+        }
+      },
+      {
+        "ruleId": "@typescript-eslint/no-unused-vars",
+        "severity": 1,
+        "message": "'value' is assigned a value but never used.",
+        "line": 3,
+        "column": 9,
+        "endLine": 3,
+        "endColumn": 14
+      }
+    ],
+    "errorCount": 1,
+    "warningCount": 1
+  }
+]

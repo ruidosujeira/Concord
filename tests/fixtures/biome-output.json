@@ -1,0 +1,21 @@
+{
+  "summary": {
+    "changed": 0,
+    "errors": 1
+  },
+  "diagnostics": [
+    {
+      "category": "lint/suspicious/noDebugger",
+      "severity": "error",
+      "description": "This is an unexpected use of the debugger statement.",
+      "location": {
+        "path": {
+          "file": "/project/src/app.ts"
+        },
+        "span": [19, 27],
+        "sourceCode": "function run() {\n  debugger;\n}\n"
+      },
+      "futureField": true
+    }
+  ]
+}

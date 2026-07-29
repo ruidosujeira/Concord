@@ -1,0 +1,29 @@
+{
+  "source": {
+    "name": "Biome",
+    "url": "https://biomejs.dev"
+  },
+  "diagnostics": [
+    {
+      "code": {
+        "url": "https://biomejs.dev/linter/rules/no-console",
+        "value": "lint/suspicious/noConsole"
+      },
+      "severity": "warning",
+      "location": {
+        "path": "/project/src/app.ts",
+        "range": {
+          "start": {
+            "line": 3,
+            "column": 2
+          },
+          "end": {
+            "line": 3,
+            "column": 9
+          }
+        }
+      },
+      "message": "Don't use console."
+    }
+  ]
+}
