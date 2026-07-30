@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -30,13 +30,18 @@ fn main() -> ExitCode {
 }
 
 fn fake_eslint() -> ExitCode {
+    fake_delay("CONCORD_FAKE_ESLINT_DELAY_MS");
     let files = source_files();
     let mut reports = Vec::new();
     let mut found = false;
     for path in files {
         let source = fs::read_to_string(&path).unwrap_or_default();
         if source.contains("SLOW") {
-            std::thread::sleep(std::time::Duration::from_secs(5));
+            println!("partial stdout before timeout");
+            eprintln!("partial stderr before timeout");
+            let _ = io::stdout().flush();
+            let _ = io::stderr().flush();
+            std::thread::sleep(std::time::Duration::from_secs(8));
         }
         let mut messages = Vec::new();
         if let Some((line, column)) = locate(&source, "debugger") {
@@ -84,10 +89,24 @@ fn fake_biome() -> ExitCode {
     if env::args().any(|argument| argument == "format") {
         return fake_formatter(false);
     }
+    fake_delay("CONCORD_FAKE_BIOME_DELAY_MS");
     let files = source_files();
     let mut diagnostics = Vec::new();
     for path in files {
         let source = fs::read_to_string(&path).unwrap_or_default();
+        if source.contains("INVALID_BIOME_JSON") {
+            println!("invalid biome stdout");
+            eprintln!("invalid biome stderr");
+            return ExitCode::SUCCESS;
+        }
+        if source.contains("BIOME_CRASH") {
+            println!("partial biome stdout");
+            eprintln!("biome crashed after starting");
+            return ExitCode::from(2);
+        }
+        if source.contains("BIOME_SUCCESS_WARNING") {
+            eprintln!("Biome configuration warning");
+        }
         if let Some((line, column)) = locate(&source, "console") {
             diagnostics.push(serde_json::json!({
                 "category": "lint/suspicious/noConsole",
@@ -102,8 +121,40 @@ fn fake_biome() -> ExitCode {
         }
     }
     let found = !diagnostics.is_empty();
-    println!("{}", serde_json::json!({"diagnostics": diagnostics}));
+    let (duration, scanner_duration) = fake_biome_timings();
+    println!(
+        "{}",
+        serde_json::json!({
+            "summary": {
+                "duration": duration,
+                "scannerDuration": scanner_duration
+            },
+            "diagnostics": diagnostics
+        })
+    );
     ExitCode::from(u8::from(found))
+}
+
+fn fake_biome_timings() -> (u64, u64) {
+    let path = env::current_dir()
+        .unwrap_or_default()
+        .join(".concord-fake-biome-run");
+    let run = fs::read_to_string(&path)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+        + 1;
+    let _ = fs::write(path, run.to_string());
+    if run == 1 { (12, 4) } else { (89, 31) }
+}
+
+fn fake_delay(variable: &str) {
+    if let Some(milliseconds) = env::var(variable)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+    }
 }
 
 fn fake_oxlint() -> ExitCode {

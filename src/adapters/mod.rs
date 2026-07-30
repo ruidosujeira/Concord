@@ -49,6 +49,7 @@ pub fn run_linter(
             executable: resolved.executable.clone(),
             arguments: display_arguments(&arguments),
             exit_code: output.exit_code,
+            stdout: truncate(&String::from_utf8_lossy(&output.stdout), 4_096),
             stderr: truncate(&String::from_utf8_lossy(&output.stderr), 4_096),
             detail: format!("stdout is not UTF-8: {error}"),
         })
@@ -70,6 +71,7 @@ pub fn run_linter(
             executable: resolved.executable.clone(),
             arguments: display_arguments(&arguments),
             exit_code: output.exit_code,
+            stdout: truncate(&stdout, 4_096),
             stderr: truncate(&stderr, 4_096),
             detail,
         })
@@ -340,6 +342,7 @@ fn exit_failure(
         executable: resolved.executable.display().to_string(),
         arguments: display_arguments(arguments),
         exit_code: output.exit_code,
+        stdout: truncate(&String::from_utf8_lossy(&output.stdout), 4_096),
         stderr: truncate(&String::from_utf8_lossy(&output.stderr), 4_096),
     }
 }

@@ -2,6 +2,30 @@
 
 All notable changes to Concord are documented here.
 
+## 0.1.2 - 2026-07-30
+
+### Fixed
+
+- Fixed nondeterministic lint JSON reports caused by volatile telemetry embedded
+  in raw structured tool output.
+- Prevented successful structured tool runs from leaking raw reporter timing
+  data into the stable report.
+- Preserved stdout and stderr context for operational failures.
+- Added regression coverage for repeated report generation and structured
+  output with varying internal timing fields.
+
+### Validation
+
+The issue was reproduced against Biome 2.5.5 and with a minimal controlled
+fixture.
+
+Two semantically identical lint executions previously produced different JSON
+reports because `candidate.stdout` retained fields such as
+`summary.duration` and `scannerDuration`.
+
+After this fix, repeated reports remain equivalent after excluding only the
+fields officially documented as variable by Concord.
+
 ## 0.1.1 - 2026-07-28
 
 ### Fixed

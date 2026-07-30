@@ -6,8 +6,9 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use similar::TextDiff;
 
-use crate::matching::{DiagnosticMatch, MatchResult};
+use crate::matching::{DiagnosticMatch, MatchResult, sort_diagnostics};
 use crate::model::{Diagnostic, Tool, ToolRun};
+use crate::process::truncate;
 use crate::scoring::LintSummary;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,11 +31,13 @@ impl LintReport {
     pub fn new(
         root: &Path,
         files: usize,
-        baseline: ToolRun,
-        candidate: ToolRun,
+        mut baseline: ToolRun,
+        mut candidate: ToolRun,
         result: MatchResult,
         summary: LintSummary,
     ) -> Self {
+        prepare_successful_lint_run(&mut baseline);
+        prepare_successful_lint_run(&mut candidate);
         Self {
             schema_version: 1,
             mode: "lint".into(),
@@ -62,6 +65,26 @@ impl LintReport {
                 }
             })
     }
+}
+
+fn prepare_successful_lint_run(run: &mut ToolRun) {
+    sort_diagnostics(&mut run.diagnostics);
+    if let Some(warning) = normalized_success_stderr(run.tool, &run.stderr) {
+        run.warnings.push(warning);
+    }
+    run.warnings.sort();
+    run.warnings.dedup();
+    run.stdout.clear();
+    run.stderr.clear();
+}
+
+fn normalized_success_stderr(tool: Tool, stderr: &str) -> Option<String> {
+    let normalized_eol = stderr.replace("\r\n", "\n").replace('\r', "\n");
+    let lines: Vec<_> = normalized_eol.lines().collect();
+    let start = lines.iter().position(|line| !line.trim().is_empty())?;
+    let end = lines.iter().rposition(|line| !line.trim().is_empty())?;
+    let normalized = lines[start..=end].join("\n");
+    Some(format!("{tool} stderr:\n{}", truncate(&normalized, 4_096)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -195,7 +218,13 @@ pub fn unified_diff(path: &str, baseline: &str, candidate: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::unified_diff;
+    use std::path::Path;
+
+    use crate::matching::compare;
+    use crate::model::{Diagnostic, DiagnosticData, Severity, Span, Tool, ToolRun};
+    use crate::scoring;
+
+    use super::{LintReport, json, unified_diff};
 
     #[test]
     fn creates_unified_diff() {
@@ -204,5 +233,175 @@ mod tests {
         assert!(diff.contains("+++ candidate/app.js"));
         assert!(diff.contains("-const x=1;"));
         assert!(diff.contains("+const x = 1;"));
+    }
+
+    #[test]
+    fn successful_lint_report_ignores_raw_biome_timings() {
+        let first = lint_report(
+            tool_run(Tool::Eslint, "[]", "", Vec::new()),
+            tool_run(
+                Tool::Biome,
+                r#"{"summary":{"duration":12,"scannerDuration":4},"diagnostics":[]}"#,
+                "",
+                Vec::new(),
+            ),
+        );
+        let second = lint_report(
+            tool_run(Tool::Eslint, "[]", "", Vec::new()),
+            tool_run(
+                Tool::Biome,
+                r#"{"summary":{"duration":89,"scannerDuration":31},"diagnostics":[]}"#,
+                "",
+                Vec::new(),
+            ),
+        );
+
+        assert_eq!(
+            json::render(&first).expect("first report"),
+            json::render(&second).expect("second report")
+        );
+    }
+
+    #[test]
+    fn successful_lint_report_omits_arbitrary_raw_output() {
+        let first = lint_report(
+            tool_run(Tool::Eslint, "eslint raw one", "", Vec::new()),
+            tool_run(Tool::Biome, "biome raw one", "\n", Vec::new()),
+        );
+        let second = lint_report(
+            tool_run(Tool::Eslint, "eslint raw two", "  \r\n", Vec::new()),
+            tool_run(Tool::Biome, "biome raw two", "", Vec::new()),
+        );
+        let first_json = json::render(&first).expect("first report");
+        let second_json = json::render(&second).expect("second report");
+
+        assert_eq!(first_json, second_json);
+        let value: serde_json::Value = serde_json::from_str(&first_json).expect("report JSON");
+        for side in ["baseline", "candidate"] {
+            assert!(value[side].get("stdout").is_none());
+            assert!(value[side].get("stderr").is_none());
+        }
+    }
+
+    #[test]
+    fn successful_lint_report_normalizes_stderr_as_a_warning() {
+        let first = lint_report(
+            tool_run(Tool::Eslint, "[]", "", Vec::new()),
+            tool_run(
+                Tool::Biome,
+                r#"{"diagnostics":[]}"#,
+                "\r\nconfiguration warning\r\n  use the new option\r\n\r\n",
+                Vec::new(),
+            ),
+        );
+        let second = lint_report(
+            tool_run(Tool::Eslint, "different raw", "\n", Vec::new()),
+            tool_run(
+                Tool::Biome,
+                "different biome raw",
+                "configuration warning\n  use the new option",
+                Vec::new(),
+            ),
+        );
+        let first_json = json::render(&first).expect("first report");
+
+        assert_eq!(first_json, json::render(&second).expect("second report"));
+        let value: serde_json::Value = serde_json::from_str(&first_json).expect("report JSON");
+        assert_eq!(
+            value["candidate"]["warnings"],
+            serde_json::json!(["Biome stderr:\nconfiguration warning\n  use the new option"])
+        );
+        assert!(value["candidate"].get("stderr").is_none());
+    }
+
+    #[test]
+    fn lint_report_orders_files_and_keeps_normalized_diagnostics() {
+        let baseline = vec![
+            diagnostic(Tool::Eslint, "src/z.ts", 9, "no-console"),
+            diagnostic(Tool::Eslint, "src/a.ts", 2, "no-debugger"),
+        ];
+        let candidate = vec![
+            diagnostic(Tool::Biome, "src/z.ts", 9, "no-console"),
+            diagnostic(Tool::Biome, "src/a.ts", 2, "no-debugger"),
+        ];
+        let first = lint_report(
+            tool_run(Tool::Eslint, "raw", "", baseline.clone()),
+            tool_run(Tool::Biome, "raw", "", candidate.clone()),
+        );
+        let second = lint_report(
+            tool_run(
+                Tool::Eslint,
+                "other raw",
+                "",
+                baseline.into_iter().rev().collect(),
+            ),
+            tool_run(
+                Tool::Biome,
+                "other raw",
+                "",
+                candidate.into_iter().rev().collect(),
+            ),
+        );
+        let first_json = json::render(&first).expect("first report");
+
+        assert_eq!(first_json, json::render(&second).expect("second report"));
+        let value: serde_json::Value = serde_json::from_str(&first_json).expect("report JSON");
+        assert_eq!(
+            value["baseline"]["diagnostics"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            value["baseline"]["diagnostics"][0]["path"],
+            serde_json::json!("src/a.ts")
+        );
+        assert_eq!(value["matches"].as_array().map(Vec::len), Some(2));
+    }
+
+    fn lint_report(baseline: ToolRun, candidate: ToolRun) -> LintReport {
+        let result = compare(baseline.diagnostics.clone(), candidate.diagnostics.clone());
+        let summary = scoring::calculate(&result);
+        LintReport::new(
+            Path::new("project"),
+            2,
+            baseline,
+            candidate,
+            result,
+            summary,
+        )
+    }
+
+    fn tool_run(tool: Tool, stdout: &str, stderr: &str, diagnostics: Vec<Diagnostic>) -> ToolRun {
+        ToolRun {
+            tool,
+            executable: tool.config_key().into(),
+            version: "1.0.0".into(),
+            arguments: vec!["--format=json".into()],
+            exit_code: Some(0),
+            duration_ms: 0,
+            diagnostics,
+            warnings: Vec::new(),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        }
+    }
+
+    fn diagnostic(tool: Tool, path: &str, line: u32, code: &str) -> Diagnostic {
+        Diagnostic::new(
+            tool,
+            path,
+            DiagnosticData {
+                code: Some(code.into()),
+                canonical_code: Some(code.into()),
+                severity: Severity::Warning,
+                message: format!("{code} diagnostic"),
+                span: Some(Span {
+                    start_line: line,
+                    start_column: 1,
+                    end_line: Some(line),
+                    end_column: Some(2),
+                }),
+                fix: None,
+            },
+        )
     }
 }

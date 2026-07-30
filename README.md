@@ -195,7 +195,7 @@ it does not ignore spaces, trailing newlines or any other differences.
 The project is one modular crate:
 
 - `process` and `discovery` resolve tools, enforce timeouts and find files;
-- `adapters` parse ESLint, Biome JSON/RDJSON and Oxlint JSON, and invoke
+- `adapters` parse ESLint, Biome JSON and Oxlint JSON, and invoke
   formatters over stdin;
 - `model`, `matching` and `scoring` provide normalized data and deterministic
   comparison;
@@ -205,6 +205,11 @@ The project is one modular crate:
 
 JSON reports use `schemaVersion: 1`. Their arrays are sorted independently of
 the order in which tools or worker threads return results.
+
+Successful structured tool runs are represented through Concord's normalized
+model. Raw stdout and stderr are retained only when they are needed to diagnose
+an operational failure. Non-empty stderr from a successful run is normalized
+into the tool's `warnings` before the raw channel is omitted.
 
 ## Real-world validation
 
