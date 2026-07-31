@@ -119,6 +119,7 @@ impl ProcessRunner {
                 executable: resolved.executable.display().to_string(),
                 arguments: "--version".into(),
                 exit_code: output.exit_code,
+                stdout: truncate(&String::from_utf8_lossy(&output.stdout), 4_096),
                 stderr: truncate(&String::from_utf8_lossy(&output.stderr), 4_096),
             }));
         }
@@ -191,13 +192,15 @@ impl ProcessRunner {
                     let _ = child.kill();
                     let _ = child.wait();
                     let _ = stdin_writer.join();
-                    let _ = stdout_reader.join();
-                    let _ = stderr_reader.join();
+                    let stdout = stdout_reader.join().unwrap_or_default();
+                    let stderr = stderr_reader.join().unwrap_or_default();
                     return Err(Box::new(ToolFailure::Timeout {
                         tool: resolved.tool.to_string(),
                         seconds: self.timeout.as_secs(),
                         executable: resolved.executable.display().to_string(),
                         arguments: argument_text,
+                        stdout: truncate(&String::from_utf8_lossy(&stdout), 4_096),
+                        stderr: truncate(&String::from_utf8_lossy(&stderr), 4_096),
                     }));
                 }
                 Err(source) => {

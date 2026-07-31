@@ -24,6 +24,15 @@ fn run(directory: &Path, arguments: &[&str]) -> Output {
         .expect("run concord")
 }
 
+fn run_with_env(directory: &Path, arguments: &[&str], environment: &[(&str, &str)]) -> Output {
+    Command::new(concord())
+        .current_dir(directory)
+        .args(arguments)
+        .envs(environment.iter().copied())
+        .output()
+        .expect("run concord")
+}
+
 fn project_with_tools(tools: &[&str]) -> TempDir {
     let directory = tempdir().expect("tempdir");
     let bin = directory.path().join("node_modules").join(".bin");
@@ -130,6 +139,178 @@ fn lint_json_is_valid_and_stable() {
     assert_eq!(report["mode"], "lint");
     assert_eq!(report["summary"]["exactMatches"], 1);
     assert!(report["failures"].is_array());
+}
+
+#[test]
+fn repeated_lint_json_ignores_raw_structured_tool_telemetry() {
+    let directory = project_with_tools(&["eslint", "biome"]);
+    fs::write(
+        directory.path().join("case.ts"),
+        "console.log('value');\ndebugger;\n",
+    )
+    .expect("source");
+    let arguments = [
+        "compare",
+        "lint",
+        "--baseline",
+        "eslint",
+        "--candidate",
+        "biome",
+        "--output",
+        "json",
+        "--no-save-report",
+        "case.ts",
+    ];
+
+    let first = run_with_env(
+        directory.path(),
+        &arguments,
+        &[
+            ("CONCORD_FAKE_ESLINT_DELAY_MS", "150"),
+            ("CONCORD_FAKE_BIOME_DELAY_MS", "0"),
+        ],
+    );
+    let second = run_with_env(
+        directory.path(),
+        &arguments,
+        &[
+            ("CONCORD_FAKE_ESLINT_DELAY_MS", "0"),
+            ("CONCORD_FAKE_BIOME_DELAY_MS", "150"),
+        ],
+    );
+    assert_eq!(first.status.code(), Some(1));
+    assert_eq!(second.status.code(), Some(1));
+    let mut first_report: serde_json::Value =
+        serde_json::from_slice(&first.stdout).expect("first report JSON");
+    let mut second_report: serde_json::Value =
+        serde_json::from_slice(&second.stdout).expect("second report JSON");
+    remove_documented_variable_fields(&mut first_report);
+    remove_documented_variable_fields(&mut second_report);
+
+    assert_eq!(first_report, second_report);
+    for side in ["baseline", "candidate"] {
+        assert!(first_report[side].get("stdout").is_none());
+        assert!(first_report[side].get("stderr").is_none());
+    }
+    assert_eq!(
+        first_report["baseline"]["diagnostics"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        first_report["candidate"]["diagnostics"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+}
+
+#[test]
+fn invalid_linter_output_retains_failure_context() {
+    let directory = project_with_tools(&["eslint", "biome"]);
+    fs::write(directory.path().join("case.ts"), "// INVALID_BIOME_JSON\n").expect("source");
+    let output = run(
+        directory.path(),
+        &[
+            "compare",
+            "lint",
+            "--baseline",
+            "eslint",
+            "--candidate",
+            "biome",
+            "--output",
+            "json",
+            "--no-save-report",
+            "case.ts",
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for expected in [
+        "failed to parse Biome JSON output",
+        "command:",
+        "exit code: Some(0)",
+        "failure stdout: invalid biome stdout",
+        "failure stderr: invalid biome stderr",
+        "failed to parse Biome structured JSON",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "missing {expected:?} in {stderr}"
+        );
+    }
+}
+
+#[test]
+fn failed_linter_execution_retains_raw_output() {
+    let directory = project_with_tools(&["eslint", "biome"]);
+    fs::write(directory.path().join("case.ts"), "// BIOME_CRASH\n").expect("source");
+    let output = run(
+        directory.path(),
+        &[
+            "compare",
+            "lint",
+            "--baseline",
+            "eslint",
+            "--candidate",
+            "biome",
+            "--output",
+            "json",
+            "--no-save-report",
+            "case.ts",
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for expected in [
+        "Biome failed",
+        "command:",
+        "exit code: Some(2)",
+        "failure stdout: partial biome stdout",
+        "failure stderr: biome crashed after starting",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "missing {expected:?} in {stderr}"
+        );
+    }
+}
+
+#[test]
+fn successful_linter_stderr_is_normalized_as_a_warning() {
+    let directory = project_with_tools(&["eslint", "biome"]);
+    fs::write(
+        directory.path().join("case.ts"),
+        "// BIOME_SUCCESS_WARNING\n",
+    )
+    .expect("source");
+    let output = run(
+        directory.path(),
+        &[
+            "compare",
+            "lint",
+            "--baseline",
+            "eslint",
+            "--candidate",
+            "biome",
+            "--output",
+            "json",
+            "--no-save-report",
+            "case.ts",
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("report JSON");
+    assert_eq!(
+        report["candidate"]["warnings"],
+        serde_json::json!(["Biome stderr:\nBiome configuration warning"])
+    );
+    assert!(report["candidate"].get("stderr").is_none());
 }
 
 #[test]
@@ -320,7 +501,7 @@ fn timeout_returns_three() {
     let directory = project_with_tools(&["eslint", "biome"]);
     fs::write(
         directory.path().join("concord.toml"),
-        "version = 1\n[execution]\ntimeout_seconds = 1\nformatter_jobs = 1\n",
+        "version = 1\n[execution]\ntimeout_seconds = 4\nformatter_jobs = 1\n",
     )
     .expect("config");
     fs::write(directory.path().join("case.ts"), "// SLOW\ndebugger;\n").expect("source");
@@ -338,7 +519,16 @@ fn timeout_returns_three() {
         ],
     );
     assert_eq!(output.status.code(), Some(3));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("timed out"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("timed out"));
+    assert!(
+        stderr.contains("failure stdout: partial stdout before timeout"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("failure stderr: partial stderr before timeout"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -377,4 +567,22 @@ fn executable_and_source_paths_with_spaces_work() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn remove_documented_variable_fields(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                remove_documented_variable_fields(value);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            object.remove("durationMs");
+            object.remove("timestamp");
+            for value in object.values_mut() {
+                remove_documented_variable_fields(value);
+            }
+        }
+        _ => {}
+    }
 }

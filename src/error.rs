@@ -52,12 +52,16 @@ pub enum ToolFailure {
         checked: String,
     },
 
-    #[error("{tool} timed out after {seconds}s\ncommand: {executable} {arguments}")]
+    #[error(
+        "{tool} timed out after {seconds}s\ncommand: {executable} {arguments}\nfailure stdout: {stdout}\nfailure stderr: {stderr}"
+    )]
     Timeout {
         tool: String,
         seconds: u64,
         executable: String,
         arguments: String,
+        stdout: String,
+        stderr: String,
     },
 
     #[error("failed to start {tool}\ncommand: {executable} {arguments}\nerror: {source}")]
@@ -69,18 +73,19 @@ pub enum ToolFailure {
     },
 
     #[error(
-        "{tool} failed\ncommand: {executable} {arguments}\nexit code: {exit_code:?}\nstderr: {stderr}"
+        "{tool} failed\ncommand: {executable} {arguments}\nexit code: {exit_code:?}\nfailure stdout: {stdout}\nfailure stderr: {stderr}"
     )]
     Exit {
         tool: String,
         executable: String,
         arguments: String,
         exit_code: Option<i32>,
+        stdout: String,
         stderr: String,
     },
 
     #[error(
-        "failed to parse {tool} {format} output\ncommand: {executable} {arguments}\nexit code: {exit_code:?}\nstderr: {stderr}\nerror: {detail}"
+        "failed to parse {tool} {format} output\ncommand: {executable} {arguments}\nexit code: {exit_code:?}\nfailure stdout: {stdout}\nfailure stderr: {stderr}\nerror: {detail}"
     )]
     InvalidOutput {
         tool: String,
@@ -88,6 +93,7 @@ pub enum ToolFailure {
         executable: PathBuf,
         arguments: String,
         exit_code: Option<i32>,
+        stdout: String,
         stderr: String,
         detail: String,
     },
