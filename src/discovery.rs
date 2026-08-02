@@ -20,8 +20,21 @@ const DEFAULT_IGNORED_DIRS: [&str; 8] = [
 ];
 
 pub fn discover(root: &Path, inputs: &[PathBuf], config: &DiscoveryConfig) -> Result<Vec<PathBuf>> {
+    discover_excluding(root, inputs, config, &[])
+}
+
+pub fn discover_excluding(
+    root: &Path,
+    inputs: &[PathBuf],
+    config: &DiscoveryConfig,
+    exact_exclusions: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
     let includes = build_globs(&config.include, "discovery.include")?;
     let excludes = build_globs(&config.exclude, "discovery.exclude")?;
+    let exact_exclusions: BTreeSet<_> = exact_exclusions
+        .iter()
+        .map(|path| normalize_path(root, path))
+        .collect();
     let targets = if inputs.is_empty() {
         vec![root.to_path_buf()]
     } else {
@@ -46,6 +59,9 @@ pub fn discover(root: &Path, inputs: &[PathBuf], config: &DiscoveryConfig) -> Re
         }
         if target.is_file() {
             let normalized = normalize_path(root, &target);
+            if exact_exclusions.contains(&normalized) {
+                continue;
+            }
             if !is_supported(&normalized, &includes, &excludes) {
                 return Err(ConcordError::usage(format!(
                     "unsupported or excluded file: {normalized}"
@@ -81,7 +97,9 @@ pub fn discover(root: &Path, inputs: &[PathBuf], config: &DiscoveryConfig) -> Re
                 continue;
             }
             let normalized = normalize_path(root, entry.path());
-            if is_supported(&normalized, &includes, &excludes) {
+            if !exact_exclusions.contains(&normalized)
+                && is_supported(&normalized, &includes, &excludes)
+            {
                 files.insert((normalized, entry.into_path()));
             }
         }

@@ -1,14 +1,11 @@
 use std::env;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    if env::args().any(|argument| argument == "--version") {
-        println!("1.0.0-test");
-        return ExitCode::SUCCESS;
-    }
     let executable = env::current_exe().unwrap_or_default();
     let name = executable
         .file_stem()
@@ -16,6 +13,18 @@ fn main() -> ExitCode {
         .unwrap_or_default()
         .trim_end_matches(".cmd")
         .to_ascii_lowercase();
+    record_invocation(&name);
+    if env::args().any(|argument| argument == "--version") {
+        if name == "oxfmt" {
+            println!(
+                "{}",
+                env::var("CONCORD_FAKE_OXFMT_VERSION").unwrap_or_else(|_| "1.0.0-test".into())
+            );
+        } else {
+            println!("1.0.0-test");
+        }
+        return ExitCode::SUCCESS;
+    }
     match name.as_str() {
         "eslint" => fake_eslint(),
         "biome" => fake_biome(),
@@ -26,6 +35,16 @@ fn main() -> ExitCode {
             eprintln!("unknown fake tool name: {name}");
             ExitCode::from(2)
         }
+    }
+}
+
+fn record_invocation(name: &str) {
+    let Ok(path) = env::var("CONCORD_FAKE_INVOCATION_LOG") else {
+        return;
+    };
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let arguments = env::args().skip(1).collect::<Vec<_>>().join(" ");
+        let _ = writeln!(file, "{name} {arguments}");
     }
 }
 
@@ -107,6 +126,18 @@ fn fake_biome() -> ExitCode {
         if source.contains("BIOME_SUCCESS_WARNING") {
             eprintln!("Biome configuration warning");
         }
+        if let Some((line, column)) = locate(&source, "CUSTOM_BIOME") {
+            diagnostics.push(serde_json::json!({
+                "category": "lint/custom/noMagic",
+                "severity": "warning",
+                "description": "Custom unmapped diagnostic.",
+                "location": {
+                    "path": {"file": absolute(&path)},
+                    "start": {"line": line, "column": column},
+                    "end": {"line": line, "column": column + 12}
+                }
+            }));
+        }
         if let Some((line, column)) = locate(&source, "console") {
             diagnostics.push(serde_json::json!({
                 "category": "lint/suspicious/noConsole",
@@ -184,6 +215,25 @@ fn fake_formatter(different: bool) -> ExitCode {
     let mut input = String::new();
     if io::stdin().read_to_string(&mut input).is_err() {
         return ExitCode::from(2);
+    }
+    if input.contains("FORMAT_CRASH") {
+        print!("partial formatter stdout");
+        eprintln!("formatter crashed after starting");
+        return ExitCode::from(2);
+    }
+    if input.contains("UNKNOWN_UNSUPPORTED") {
+        eprintln!("unsupported internal state caused a crash");
+        return ExitCode::from(2);
+    }
+    if input.contains("SLOW_FORMAT") {
+        println!("partial formatter stdout before timeout");
+        eprintln!("partial formatter stderr before timeout");
+        let _ = io::stdout().flush();
+        let _ = io::stderr().flush();
+        std::thread::sleep(std::time::Duration::from_secs(8));
+    }
+    if input.contains("FORMAT_SUCCESS_WARNING") {
+        eprintln!("formatter configuration warning");
     }
     if different && input.contains("DIFF") && !input.ends_with("// oxfmt\n") {
         input.push_str("// oxfmt\n");

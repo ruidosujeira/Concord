@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "mode": "lint",
+  "files": 1,
+  "summary": {
+    "baselineDiagnostics": 0,
+    "candidateDiagnostics": 0,
+    "exactMatches": 0
+  },
+  "matches": [],
+  "baselineOnly": [],
+  "candidateOnly": [],
+  "failures": []
+}

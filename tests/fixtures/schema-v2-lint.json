@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 2,
+  "mode": "lint",
+  "profile": "raw",
+  "plan": {
+    "discovered": [],
+    "comparable": [],
+    "unsupported": [],
+    "skipped": [],
+    "tools": []
+  },
+  "rawSummary": {},
+  "comparableSummary": {},
+  "mappingSummary": {},
+  "matches": [],
+  "baselineOnly": [],
+  "candidateOnly": [],
+  "unmappedBaseline": [],
+  "unmappedCandidate": [],
+  "unsupportedFiles": [],
+  "skippedFiles": [],
+  "failures": []
+}

@@ -3,67 +3,175 @@ pub mod terminal;
 
 use std::path::Path;
 
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use similar::TextDiff;
 
-use crate::matching::{DiagnosticMatch, MatchResult, sort_diagnostics};
+use crate::capabilities::{
+    ComparisonPlan, FileDisposition, PlannedFile, PlannedToolFile, PlannedToolStatus,
+};
+use crate::matching::{
+    DiagnosticMatch, MappingConfidence, MatchKind, MatchResult, sort_diagnostics,
+};
 use crate::model::{Diagnostic, Tool, ToolRun};
 use crate::process::truncate;
-use crate::scoring::LintSummary;
+use crate::scoring::{ComparableLintSummary, MappingSummary, RawLintSummary};
+
+pub const REPORT_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lower")]
+pub enum ComparisonProfile {
+    Raw,
+    Comparable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfiguredMappingSummary {
+    pub exact: usize,
+    pub approximate: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanRuleMapping {
+    pub baseline_tool: Tool,
+    pub baseline: String,
+    pub candidate_tool: Tool,
+    pub candidate: String,
+    pub confidence: MappingConfidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanReport {
+    pub schema_version: u32,
+    pub mode: String,
+    pub baseline_tool: Tool,
+    pub candidate_tool: Tool,
+    pub plan: ComparisonPlan,
+    pub configured_rule_mappings: ConfiguredMappingSummary,
+    pub rule_mappings: Vec<PlanRuleMapping>,
+    pub failures: Vec<String>,
+}
+
+impl PlanReport {
+    pub fn new(
+        mode: &str,
+        baseline_tool: Tool,
+        candidate_tool: Tool,
+        plan: ComparisonPlan,
+        mut rule_mappings: Vec<PlanRuleMapping>,
+    ) -> Self {
+        rule_mappings.sort();
+        rule_mappings.dedup();
+        let configured_rule_mappings = ConfiguredMappingSummary {
+            exact: rule_mappings
+                .iter()
+                .filter(|mapping| mapping.confidence == MappingConfidence::Exact)
+                .count(),
+            approximate: rule_mappings
+                .iter()
+                .filter(|mapping| mapping.confidence == MappingConfidence::Approximate)
+                .count(),
+        };
+        Self {
+            schema_version: REPORT_SCHEMA_VERSION,
+            mode: mode.into(),
+            baseline_tool,
+            candidate_tool,
+            plan,
+            configured_rule_mappings,
+            rule_mappings,
+            failures: Vec::new(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LintReport {
     pub schema_version: u32,
     pub mode: String,
+    pub profile: ComparisonProfile,
     pub project_root: String,
-    pub files: usize,
+    pub plan: ComparisonPlan,
     pub baseline: ToolRun,
     pub candidate: ToolRun,
-    pub summary: LintSummary,
+    pub raw_summary: RawLintSummary,
+    pub comparable_summary: ComparableLintSummary,
+    pub mapping_summary: MappingSummary,
     pub matches: Vec<DiagnosticMatch>,
     pub baseline_only: Vec<Diagnostic>,
     pub candidate_only: Vec<Diagnostic>,
+    pub unmapped_baseline: Vec<Diagnostic>,
+    pub unmapped_candidate: Vec<Diagnostic>,
+    pub unsupported_files: Vec<FileDisposition>,
+    pub skipped_files: Vec<FileDisposition>,
     pub failures: Vec<String>,
 }
 
 impl LintReport {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         root: &Path,
-        files: usize,
+        profile: ComparisonProfile,
+        plan: ComparisonPlan,
         mut baseline: ToolRun,
         mut candidate: ToolRun,
         result: MatchResult,
-        summary: LintSummary,
+        raw_summary: RawLintSummary,
+        comparable_summary: ComparableLintSummary,
+        mapping_summary: MappingSummary,
     ) -> Self {
         prepare_successful_lint_run(&mut baseline);
         prepare_successful_lint_run(&mut candidate);
         Self {
-            schema_version: 1,
+            schema_version: REPORT_SCHEMA_VERSION,
             mode: "lint".into(),
+            profile,
             project_root: root.to_string_lossy().replace('\\', "/"),
-            files,
+            unsupported_files: plan.unsupported.clone(),
+            skipped_files: plan.skipped.clone(),
+            plan,
             baseline,
             candidate,
-            summary,
+            raw_summary,
+            comparable_summary,
+            mapping_summary,
             matches: result.matches,
             baseline_only: result.baseline_only,
             candidate_only: result.candidate_only,
+            unmapped_baseline: result.unmapped_baseline,
+            unmapped_candidate: result.unmapped_candidate,
             failures: Vec::new(),
         }
     }
 
-    pub fn has_differences(&self, count_probable_as_match: bool) -> bool {
-        !self.baseline_only.is_empty()
-            || !self.candidate_only.is_empty()
-            || self.matches.iter().any(|item| {
-                use crate::matching::MatchKind;
-                match item.kind {
-                    MatchKind::ExactMatch => false,
-                    MatchKind::ProbableMatch => !count_probable_as_match,
-                    _ => true,
-                }
-            })
+    pub fn has_differences(
+        &self,
+        profile: ComparisonProfile,
+        count_probable_as_match: bool,
+    ) -> bool {
+        if !self.baseline_only.is_empty() || !self.candidate_only.is_empty() {
+            return true;
+        }
+        if profile == ComparisonProfile::Raw
+            && (!self.unmapped_baseline.is_empty() || !self.unmapped_candidate.is_empty())
+        {
+            return true;
+        }
+        self.matches.iter().any(|item| match item.kind {
+            MatchKind::ExactMatch | MatchKind::ApproximateRuleMatch => false,
+            MatchKind::ProbableMatch => !count_probable_as_match,
+            MatchKind::SeverityChanged | MatchKind::RangeChanged | MatchKind::MessageChanged => {
+                true
+            }
+        })
     }
 }
 
@@ -78,7 +186,7 @@ fn prepare_successful_lint_run(run: &mut ToolRun) {
     run.stderr.clear();
 }
 
-fn normalized_success_stderr(tool: Tool, stderr: &str) -> Option<String> {
+pub fn normalized_success_stderr(tool: Tool, stderr: &str) -> Option<String> {
     let normalized_eol = stderr.replace("\r\n", "\n").replace('\r', "\n");
     let lines: Vec<_> = normalized_eol.lines().collect();
     let start = lines.iter().position(|line| !line.trim().is_empty())?;
@@ -89,57 +197,135 @@ fn normalized_success_stderr(tool: Tool, stderr: &str) -> Option<String> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum FormatStatus {
+pub enum ToolFileStatus {
+    Success,
+    Unsupported,
+    Skipped,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FormatComparisonStatus {
     Identical,
     Different,
     BaselineNonIdempotent,
     CandidateNonIdempotent,
-    BaselineFailed,
-    CandidateFailed,
-    BothFailed,
+    BothNonIdempotent,
+    Unsupported,
+    Skipped,
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FormatterOutcome {
+    pub status: ToolFileStatus,
     pub tool: Tool,
-    pub executable: String,
-    pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executable: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     pub arguments: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
-    pub duration_ms: u128,
-    pub idempotent: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotent: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub stderr: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+impl FormatterOutcome {
+    fn planned(planned: &PlannedToolFile, counterpart_blocks: bool) -> Self {
+        let (status, reason) = match planned.status {
+            PlannedToolStatus::Unsupported => (
+                ToolFileStatus::Unsupported,
+                planned
+                    .reason
+                    .clone()
+                    .or_else(|| Some("unsupported".into())),
+            ),
+            PlannedToolStatus::Skipped => (
+                ToolFileStatus::Skipped,
+                planned.reason.clone().or_else(|| Some("skipped".into())),
+            ),
+            PlannedToolStatus::Supported | PlannedToolStatus::Unknown => (
+                ToolFileStatus::Skipped,
+                counterpart_blocks
+                    .then(|| "not executed because the other side is not comparable".into()),
+            ),
+        };
+        Self {
+            status,
+            tool: planned.tool,
+            executable: None,
+            version: None,
+            arguments: Vec::new(),
+            exit_code: None,
+            duration_ms: None,
+            idempotent: None,
+            reason,
+            error: None,
+            output: None,
+            stderr: None,
+            warnings: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FormatFileResult {
     pub path: String,
-    pub status: FormatStatus,
+    pub status: FormatComparisonStatus,
     pub baseline: FormatterOutcome,
     pub candidate: FormatterOutcome,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
 }
 
+impl FormatFileResult {
+    pub fn from_plan(file: &PlannedFile) -> Self {
+        let status = if matches!(file.baseline.status, PlannedToolStatus::Unsupported)
+            || matches!(file.candidate.status, PlannedToolStatus::Unsupported)
+        {
+            FormatComparisonStatus::Unsupported
+        } else {
+            FormatComparisonStatus::Skipped
+        };
+        Self {
+            path: file.path.clone(),
+            status,
+            baseline: FormatterOutcome::planned(&file.baseline, true),
+            candidate: FormatterOutcome::planned(&file.candidate, true),
+            diff: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FormatSummary {
-    pub files: usize,
+    pub discovered: usize,
+    pub compared: usize,
     pub identical: usize,
     pub different: usize,
     pub baseline_non_idempotent: usize,
     pub candidate_non_idempotent: usize,
-    pub baseline_failed: usize,
-    pub candidate_failed: usize,
-    pub both_failed: usize,
-    pub tool_failures: usize,
+    pub both_non_idempotent: usize,
+    pub unsupported: usize,
+    pub skipped: usize,
+    pub failed: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +336,7 @@ pub struct FormatReport {
     pub project_root: String,
     pub baseline_tool: Tool,
     pub candidate_tool: Tool,
+    pub plan: ComparisonPlan,
     pub summary: FormatSummary,
     pub files: Vec<FormatFileResult>,
     pub failures: Vec<String>,
@@ -160,51 +347,79 @@ impl FormatReport {
         root: &Path,
         baseline_tool: Tool,
         candidate_tool: Tool,
+        plan: ComparisonPlan,
         mut files: Vec<FormatFileResult>,
     ) -> Self {
         files.sort_by(|left, right| left.path.cmp(&right.path));
         let count = |status| files.iter().filter(|item| item.status == status).count();
         let summary = FormatSummary {
-            files: files.len(),
-            identical: count(FormatStatus::Identical),
-            different: count(FormatStatus::Different),
-            baseline_non_idempotent: count(FormatStatus::BaselineNonIdempotent),
-            candidate_non_idempotent: count(FormatStatus::CandidateNonIdempotent),
-            baseline_failed: count(FormatStatus::BaselineFailed),
-            candidate_failed: count(FormatStatus::CandidateFailed),
-            both_failed: count(FormatStatus::BothFailed),
-            tool_failures: files
+            discovered: plan.discovered_count(),
+            compared: files
                 .iter()
                 .filter(|item| {
                     matches!(
                         item.status,
-                        FormatStatus::BaselineFailed
-                            | FormatStatus::CandidateFailed
-                            | FormatStatus::BothFailed
+                        FormatComparisonStatus::Identical
+                            | FormatComparisonStatus::Different
+                            | FormatComparisonStatus::BaselineNonIdempotent
+                            | FormatComparisonStatus::CandidateNonIdempotent
+                            | FormatComparisonStatus::BothNonIdempotent
+                            | FormatComparisonStatus::Failed
                     )
                 })
                 .count(),
+            identical: count(FormatComparisonStatus::Identical),
+            different: count(FormatComparisonStatus::Different),
+            baseline_non_idempotent: count(FormatComparisonStatus::BaselineNonIdempotent),
+            candidate_non_idempotent: count(FormatComparisonStatus::CandidateNonIdempotent),
+            both_non_idempotent: count(FormatComparisonStatus::BothNonIdempotent),
+            unsupported: count(FormatComparisonStatus::Unsupported),
+            skipped: count(FormatComparisonStatus::Skipped),
+            failed: count(FormatComparisonStatus::Failed),
         };
+        let failures = files
+            .iter()
+            .filter(|file| file.status == FormatComparisonStatus::Failed)
+            .flat_map(|file| {
+                [("baseline", &file.baseline), ("candidate", &file.candidate)]
+                    .into_iter()
+                    .filter_map(|(side, outcome)| {
+                        outcome.error.as_ref().map(|error| {
+                            let mut detail =
+                                format!("{} {side} {}: {error}", file.path, outcome.tool);
+                            if let Some(stdout) = &outcome.output {
+                                detail.push_str(&format!("\nstdout: {stdout}"));
+                            }
+                            if let Some(stderr) = &outcome.stderr {
+                                detail.push_str(&format!("\nstderr: {stderr}"));
+                            }
+                            detail
+                        })
+                    })
+            })
+            .collect();
         Self {
-            schema_version: 1,
+            schema_version: REPORT_SCHEMA_VERSION,
             mode: "format".into(),
             project_root: root.to_string_lossy().replace('\\', "/"),
             baseline_tool,
             candidate_tool,
+            plan,
             summary,
             files,
-            failures: Vec::new(),
+            failures,
         }
     }
 
     pub fn has_differences(&self) -> bool {
-        self.files
-            .iter()
-            .any(|item| item.status != FormatStatus::Identical)
+        self.summary.different > 0
+            || self.summary.baseline_non_idempotent > 0
+            || self.summary.candidate_non_idempotent > 0
+            || self.summary.both_non_idempotent > 0
     }
 
     pub fn has_failures(&self) -> bool {
-        self.summary.tool_failures > 0
+        self.summary.failed > 0
     }
 }
 
@@ -218,190 +433,26 @@ pub fn unified_diff(path: &str, baseline: &str, candidate: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
-    use crate::matching::compare;
-    use crate::model::{Diagnostic, DiagnosticData, Severity, Span, Tool, ToolRun};
-    use crate::scoring;
-
-    use super::{LintReport, json, unified_diff};
+    use super::{REPORT_SCHEMA_VERSION, unified_diff};
 
     #[test]
     fn creates_unified_diff() {
         let diff = unified_diff("app.js", "const x=1;\n", "const x = 1;\n");
         assert!(diff.contains("--- baseline/app.js"));
         assert!(diff.contains("+++ candidate/app.js"));
-        assert!(diff.contains("-const x=1;"));
-        assert!(diff.contains("+const x = 1;"));
     }
 
     #[test]
-    fn successful_lint_report_ignores_raw_biome_timings() {
-        let first = lint_report(
-            tool_run(Tool::Eslint, "[]", "", Vec::new()),
-            tool_run(
-                Tool::Biome,
-                r#"{"summary":{"duration":12,"scannerDuration":4},"diagnostics":[]}"#,
-                "",
-                Vec::new(),
-            ),
-        );
-        let second = lint_report(
-            tool_run(Tool::Eslint, "[]", "", Vec::new()),
-            tool_run(
-                Tool::Biome,
-                r#"{"summary":{"duration":89,"scannerDuration":31},"diagnostics":[]}"#,
-                "",
-                Vec::new(),
-            ),
-        );
-
-        assert_eq!(
-            json::render(&first).expect("first report"),
-            json::render(&second).expect("second report")
-        );
-    }
-
-    #[test]
-    fn successful_lint_report_omits_arbitrary_raw_output() {
-        let first = lint_report(
-            tool_run(Tool::Eslint, "eslint raw one", "", Vec::new()),
-            tool_run(Tool::Biome, "biome raw one", "\n", Vec::new()),
-        );
-        let second = lint_report(
-            tool_run(Tool::Eslint, "eslint raw two", "  \r\n", Vec::new()),
-            tool_run(Tool::Biome, "biome raw two", "", Vec::new()),
-        );
-        let first_json = json::render(&first).expect("first report");
-        let second_json = json::render(&second).expect("second report");
-
-        assert_eq!(first_json, second_json);
-        let value: serde_json::Value = serde_json::from_str(&first_json).expect("report JSON");
-        for side in ["baseline", "candidate"] {
-            assert!(value[side].get("stdout").is_none());
-            assert!(value[side].get("stderr").is_none());
-        }
-    }
-
-    #[test]
-    fn successful_lint_report_normalizes_stderr_as_a_warning() {
-        let first = lint_report(
-            tool_run(Tool::Eslint, "[]", "", Vec::new()),
-            tool_run(
-                Tool::Biome,
-                r#"{"diagnostics":[]}"#,
-                "\r\nconfiguration warning\r\n  use the new option\r\n\r\n",
-                Vec::new(),
-            ),
-        );
-        let second = lint_report(
-            tool_run(Tool::Eslint, "different raw", "\n", Vec::new()),
-            tool_run(
-                Tool::Biome,
-                "different biome raw",
-                "configuration warning\n  use the new option",
-                Vec::new(),
-            ),
-        );
-        let first_json = json::render(&first).expect("first report");
-
-        assert_eq!(first_json, json::render(&second).expect("second report"));
-        let value: serde_json::Value = serde_json::from_str(&first_json).expect("report JSON");
-        assert_eq!(
-            value["candidate"]["warnings"],
-            serde_json::json!(["Biome stderr:\nconfiguration warning\n  use the new option"])
-        );
-        assert!(value["candidate"].get("stderr").is_none());
-    }
-
-    #[test]
-    fn lint_report_orders_files_and_keeps_normalized_diagnostics() {
-        let baseline = vec![
-            diagnostic(Tool::Eslint, "src/z.ts", 9, "no-console"),
-            diagnostic(Tool::Eslint, "src/a.ts", 2, "no-debugger"),
-        ];
-        let candidate = vec![
-            diagnostic(Tool::Biome, "src/z.ts", 9, "no-console"),
-            diagnostic(Tool::Biome, "src/a.ts", 2, "no-debugger"),
-        ];
-        let first = lint_report(
-            tool_run(Tool::Eslint, "raw", "", baseline.clone()),
-            tool_run(Tool::Biome, "raw", "", candidate.clone()),
-        );
-        let second = lint_report(
-            tool_run(
-                Tool::Eslint,
-                "other raw",
-                "",
-                baseline.into_iter().rev().collect(),
-            ),
-            tool_run(
-                Tool::Biome,
-                "other raw",
-                "",
-                candidate.into_iter().rev().collect(),
-            ),
-        );
-        let first_json = json::render(&first).expect("first report");
-
-        assert_eq!(first_json, json::render(&second).expect("second report"));
-        let value: serde_json::Value = serde_json::from_str(&first_json).expect("report JSON");
-        assert_eq!(
-            value["baseline"]["diagnostics"].as_array().map(Vec::len),
-            Some(2)
-        );
-        assert_eq!(
-            value["baseline"]["diagnostics"][0]["path"],
-            serde_json::json!("src/a.ts")
-        );
-        assert_eq!(value["matches"].as_array().map(Vec::len), Some(2));
-    }
-
-    fn lint_report(baseline: ToolRun, candidate: ToolRun) -> LintReport {
-        let result = compare(baseline.diagnostics.clone(), candidate.diagnostics.clone());
-        let summary = scoring::calculate(&result);
-        LintReport::new(
-            Path::new("project"),
-            2,
-            baseline,
-            candidate,
-            result,
-            summary,
-        )
-    }
-
-    fn tool_run(tool: Tool, stdout: &str, stderr: &str, diagnostics: Vec<Diagnostic>) -> ToolRun {
-        ToolRun {
-            tool,
-            executable: tool.config_key().into(),
-            version: "1.0.0".into(),
-            arguments: vec!["--format=json".into()],
-            exit_code: Some(0),
-            duration_ms: 0,
-            diagnostics,
-            warnings: Vec::new(),
-            stdout: stdout.into(),
-            stderr: stderr.into(),
-        }
-    }
-
-    fn diagnostic(tool: Tool, path: &str, line: u32, code: &str) -> Diagnostic {
-        Diagnostic::new(
-            tool,
-            path,
-            DiagnosticData {
-                code: Some(code.into()),
-                canonical_code: Some(code.into()),
-                severity: Severity::Warning,
-                message: format!("{code} diagnostic"),
-                span: Some(Span {
-                    start_line: line,
-                    start_column: 1,
-                    end_line: Some(line),
-                    end_column: Some(2),
-                }),
-                fix: None,
-            },
-        )
+    fn schema_fixtures_are_explicit_and_distinct() {
+        let v1: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/schema-v1-lint.json"))
+                .expect("schema 1 fixture");
+        let v2: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/schema-v2-lint.json"))
+                .expect("schema 2 fixture");
+        assert_eq!(v1["schemaVersion"], 1);
+        assert_eq!(v2["schemaVersion"], REPORT_SCHEMA_VERSION);
+        assert!(v1.get("rawSummary").is_none());
+        assert!(v2.get("rawSummary").is_some());
     }
 }

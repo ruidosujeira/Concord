@@ -1,4 +1,5 @@
 pub mod adapters;
+pub mod capabilities;
 pub mod cli;
 pub mod config;
 pub mod discovery;
