@@ -13,14 +13,42 @@ npm install --save-dev --save-exact \
   @biomejs/biome@2.5.5 \
   oxlint@1.75.0 \
   prettier@3.9.6 \
-  oxfmt@0.61.0
+  oxfmt@0.60.0
 
-mkdir src
+mkdir src reports
 cat >eslint.config.mjs <<'EOF'
 export default [{
   files: ["**/*.{js,ts}"],
   rules: { "no-debugger": "error", "no-console": "warn" },
 }];
+EOF
+cat >biome.json <<'EOF'
+{
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": false,
+      "suspicious": { "noDebugger": "error", "noConsole": "warn" }
+    }
+  }
+}
+EOF
+cat >concord.toml <<'EOF'
+version = 1
+
+[[matching.rules]]
+baseline_tool = "eslint"
+baseline = "no-debugger"
+candidate_tool = "biome"
+candidate = "lint/suspicious/noDebugger"
+confidence = "exact"
+
+[[matching.rules]]
+baseline_tool = "eslint"
+baseline = "no-console"
+candidate_tool = "biome"
+candidate = "lint/suspicious/noConsole"
+confidence = "approximate"
 EOF
 cat >src/case.js <<'EOF'
 const value={answer:42}
@@ -39,8 +67,34 @@ run_comparison() {
   fi
 }
 
+expect_status() {
+  expected="$1"
+  shift
+  set +e
+  cargo run --quiet --manifest-path "$repo_root/Cargo.toml" -- "$@"
+  actual=$?
+  set -e
+  if [[ "$actual" -ne "$expected" ]]; then
+    echo "expected exit $expected, got $actual: concord $*" >&2
+    return 1
+  fi
+}
+
 cargo run --quiet --manifest-path "$repo_root/Cargo.toml" -- doctor
-run_comparison compare lint --baseline eslint --candidate biome --no-save-report src
-run_comparison compare lint --baseline eslint --candidate oxlint --no-save-report src
-run_comparison compare format --baseline prettier --candidate oxfmt --no-save-report src
-run_comparison compare format --baseline biome --candidate prettier --no-save-report src
+cargo run --quiet --manifest-path "$repo_root/Cargo.toml" -- plan lint --baseline eslint --candidate biome --no-save-report src
+cargo run --quiet --manifest-path "$repo_root/Cargo.toml" -- plan format --baseline oxfmt --candidate prettier --no-save-report .
+run_comparison compare lint --baseline eslint --candidate biome --profile comparable --no-save-report src
+run_comparison compare lint --baseline eslint --candidate oxlint --profile comparable --no-save-report src
+run_comparison compare format --baseline prettier --candidate biome --no-save-report src
+run_comparison compare format --baseline prettier --candidate oxfmt --unsupported-policy ignore --no-save-report src package-lock.json
+expect_status 1 compare format --baseline prettier --candidate oxfmt --unsupported-policy difference --no-save-report package-lock.json
+expect_status 3 compare format --baseline prettier --candidate oxfmt --unsupported-policy error --no-save-report package-lock.json
+
+run_comparison compare lint --baseline eslint --candidate biome --profile comparable --report-file "reports/concord report.json" src
+cargo run --quiet --manifest-path "$repo_root/Cargo.toml" -- plan lint --baseline eslint --candidate biome --report-file reports/plan-first.json src
+cargo run --quiet --manifest-path "$repo_root/Cargo.toml" -- plan lint --baseline eslint --candidate biome --report-file reports/plan-second.json src
+cmp reports/plan-first.json reports/plan-second.json
+
+test -s "reports/concord report.json"
+test -s reports/plan-first.json
+test -s reports/plan-second.json
