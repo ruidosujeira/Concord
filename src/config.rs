@@ -322,8 +322,8 @@ fn validate_rule_mappings(config: &Config) -> Result<()> {
             ));
         }
         let mut pair = [
-            (mapping.baseline_tool, baseline.to_owned()),
-            (mapping.candidate_tool, candidate.to_owned()),
+            (mapping.baseline_tool, baseline.to_ascii_lowercase()),
+            (mapping.candidate_tool, candidate.to_ascii_lowercase()),
         ];
         pair.sort();
         if !pairs.insert(pair.clone()) {
@@ -477,6 +477,19 @@ confidence = "exact"
                 .expect_err("conflict")
                 .to_string()
                 .contains("conflicting")
+        );
+
+        let case_duplicate = duplicate.replacen(
+            "baseline = \"b\"\ncandidate_tool = \"eslint\"\ncandidate = \"a\"",
+            "baseline = \"B\"\ncandidate_tool = \"eslint\"\ncandidate = \"A\"",
+            1,
+        );
+        fs::write(directory.path().join("concord.toml"), case_duplicate).expect("config");
+        assert!(
+            load(None, directory.path())
+                .expect_err("case-insensitive duplicate")
+                .to_string()
+                .contains("duplicate")
         );
     }
 }
