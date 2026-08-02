@@ -1,0 +1,22 @@
+version = 1
+
+[discovery]
+include = ["**/*.js", "**/*.ts", "**/*.json"]
+exclude = ["**/generated/**"]
+
+[execution]
+timeout_seconds = 30
+formatter_jobs = 4
+
+[tools.eslint]
+command = "eslint"
+
+[tools.biome]
+command = "biome"
+
+[matching]
+count_probable_as_match = false
+
+[[matching.aliases]]
+eslint = "@typescript-eslint/no-unused-vars"
+biome = "lint/correctness/noUnusedVariables"

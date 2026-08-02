@@ -11,10 +11,10 @@ use tempfile::Builder;
 use crate::adapters::{FormatterAdapter, compare_format_file, run_linter};
 use crate::config::Config;
 use crate::error::{ConcordError, Result};
-use crate::matching::{AliasTable, MatchKind, compare};
+use crate::matching::{AliasTable, MatchKind, RuleMappingTable, compare_with_mappings};
 use crate::model::{Diagnostic, Severity, Tool};
 use crate::process::ProcessRunner;
-use crate::report::FormatStatus;
+use crate::report::{FormatComparisonStatus, REPORT_SCHEMA_VERSION};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -126,7 +126,8 @@ pub fn reduce(root: &Path, config: &Config, request: ReductionRequest) -> Result
 
     let runner = ProcessRunner::new(root.to_path_buf(), config.clone(), request.timeout_seconds);
     let aliases = AliasTable::new(&config.matching.aliases);
-    let predicate = Predicate::new(root, runner, aliases, &request, temp_path)?;
+    let mappings = RuleMappingTable::new(&config.matching.rules, &config.matching.aliases);
+    let predicate = Predicate::new(root, runner, aliases, mappings, &request, temp_path)?;
     let signature = predicate.signature.clone();
     let started = Instant::now();
     let original_lines = line_count(&original);
@@ -154,7 +155,7 @@ pub fn reduce(root: &Path, config: &Config, request: ReductionRequest) -> Result
         )));
     }
     Ok(ReductionResult {
-        schema_version: 1,
+        schema_version: REPORT_SCHEMA_VERSION,
         mode: request.mode,
         baseline: request.baseline,
         candidate: request.candidate,
@@ -173,6 +174,7 @@ struct Predicate<'a> {
     root: &'a Path,
     runner: ProcessRunner,
     aliases: AliasTable,
+    mappings: RuleMappingTable,
     mode: ReduceMode,
     baseline: Tool,
     candidate: Tool,
@@ -187,6 +189,7 @@ impl<'a> Predicate<'a> {
         root: &'a Path,
         runner: ProcessRunner,
         aliases: AliasTable,
+        mappings: RuleMappingTable,
         request: &ReductionRequest,
         temp_path: PathBuf,
     ) -> Result<Self> {
@@ -202,6 +205,7 @@ impl<'a> Predicate<'a> {
             root,
             runner,
             aliases,
+            mappings,
             mode: request.mode,
             baseline: request.baseline,
             candidate: request.candidate,
@@ -262,7 +266,13 @@ impl<'a> Predicate<'a> {
             .map_err(|_| ConcordError::operational("baseline reducer worker panicked"))??;
         let candidate = candidate_join
             .map_err(|_| ConcordError::operational("candidate reducer worker panicked"))??;
-        let result = compare(baseline.diagnostics, candidate.diagnostics);
+        let result = compare_with_mappings(
+            baseline.diagnostics,
+            candidate.diagnostics,
+            &self.mappings,
+            self.baseline,
+            self.candidate,
+        );
         let mut signatures = Vec::new();
         signatures.extend(
             result
@@ -275,6 +285,18 @@ impl<'a> Predicate<'a> {
                 .candidate_only
                 .into_iter()
                 .map(|diagnostic| unmatched_signature("candidate", diagnostic)),
+        );
+        signatures.extend(
+            result
+                .unmapped_baseline
+                .into_iter()
+                .map(|diagnostic| unmatched_signature("unmapped_baseline", diagnostic)),
+        );
+        signatures.extend(
+            result
+                .unmapped_candidate
+                .into_iter()
+                .map(|diagnostic| unmatched_signature("unmapped_candidate", diagnostic)),
         );
         signatures.extend(
             result
@@ -320,15 +342,12 @@ impl<'a> Predicate<'a> {
             candidate,
             false,
         );
-        if matches!(
-            result.status,
-            FormatStatus::BaselineFailed | FormatStatus::CandidateFailed | FormatStatus::BothFailed
-        ) {
+        if matches!(result.status, FormatComparisonStatus::Failed) {
             return Err(ConcordError::operational(
                 "a formatter failed while evaluating the reduction",
             ));
         }
-        if result.status == FormatStatus::Identical {
+        if result.status == FormatComparisonStatus::Identical {
             return Ok(Vec::new());
         }
         Ok(vec![MismatchSignature {
@@ -344,7 +363,7 @@ impl<'a> Predicate<'a> {
 fn unmatched_signature(side: &str, diagnostic: Diagnostic) -> MismatchSignature {
     let canonical_code = diagnostic.canonical_code.clone();
     let identity = diagnostic_signature(&diagnostic);
-    let (baseline, candidate) = if side == "baseline" {
+    let (baseline, candidate) = if side.ends_with("baseline") || side == "baseline" {
         (Some(identity), None)
     } else {
         (None, Some(identity))
@@ -475,6 +494,7 @@ fn human_bytes(bytes: usize) -> String {
 fn match_kind_name(kind: MatchKind) -> &'static str {
     match kind {
         MatchKind::ExactMatch => "exact_match",
+        MatchKind::ApproximateRuleMatch => "approximate_rule_match",
         MatchKind::ProbableMatch => "probable_match",
         MatchKind::SeverityChanged => "severity_changed",
         MatchKind::RangeChanged => "range_changed",
@@ -482,15 +502,16 @@ fn match_kind_name(kind: MatchKind) -> &'static str {
     }
 }
 
-fn format_status_name(status: FormatStatus) -> &'static str {
+fn format_status_name(status: FormatComparisonStatus) -> &'static str {
     match status {
-        FormatStatus::Identical => "identical",
-        FormatStatus::Different => "different",
-        FormatStatus::BaselineNonIdempotent => "baseline_non_idempotent",
-        FormatStatus::CandidateNonIdempotent => "candidate_non_idempotent",
-        FormatStatus::BaselineFailed => "baseline_failed",
-        FormatStatus::CandidateFailed => "candidate_failed",
-        FormatStatus::BothFailed => "both_failed",
+        FormatComparisonStatus::Identical => "identical",
+        FormatComparisonStatus::Different => "different",
+        FormatComparisonStatus::BaselineNonIdempotent => "baseline_non_idempotent",
+        FormatComparisonStatus::CandidateNonIdempotent => "candidate_non_idempotent",
+        FormatComparisonStatus::BothNonIdempotent => "both_non_idempotent",
+        FormatComparisonStatus::Unsupported => "unsupported",
+        FormatComparisonStatus::Skipped => "skipped",
+        FormatComparisonStatus::Failed => "failed",
     }
 }
 

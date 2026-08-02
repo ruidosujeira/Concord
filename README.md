@@ -24,9 +24,12 @@ Install the official tagged release:
 ```bash
 cargo install \
   --git https://github.com/ruidosujeira/Concord.git \
-  --tag v0.1.1 \
+  --tag v0.1.2 \
   --locked
 ```
+
+The repository is currently developing v0.2.0-alpha.1. The stable installation
+above remains v0.1.2; the alpha has not been published.
 
 ### Install locally
 
@@ -61,6 +64,23 @@ concord compare lint \
   --baseline eslint \
   --candidate oxlint \
   --output json \
+  .
+```
+
+Inspect the comparable surface without executing either tool:
+
+```console
+concord plan lint --baseline eslint --candidate biome src
+concord plan format --baseline oxfmt --candidate prettier .
+```
+
+Use only comparable files and mapped rules for the primary lint result:
+
+```console
+concord compare lint \
+  --baseline eslint \
+  --candidate biome \
+  --profile comparable \
   .
 ```
 
@@ -100,7 +120,9 @@ concord reduce \
 Comparisons save JSON under `.concord/reports/` by default. Use
 `--no-save-report` to disable that copy. `--output terminal` is the default;
 `--output json` keeps stdout machine-readable and writes the saved-report path
-to stderr.
+to stderr. `--report-file reports/concord.json` atomically writes JSON to an
+explicit destination and replaces the default save. It cannot be combined with
+`--no-save-report`, and the exact destination is excluded from discovery.
 
 ## Configuration
 
@@ -125,6 +147,9 @@ formatter_jobs = 4
 
 [tools.eslint]
 command = "/project/node_modules/.bin/eslint"
+include = ["**/*.js", "**/*.ts"]
+exclude = ["**/generated/**"]
+unsupported = ["**/legacy/**"]
 
 [tools.biome]
 command = "/project/node_modules/.bin/biome"
@@ -141,6 +166,25 @@ command = "/project/node_modules/.bin/oxfmt"
 [matching]
 count_probable_as_match = false
 
+[[matching.rules]]
+baseline_tool = "eslint"
+baseline = "@typescript-eslint/no-unused-vars"
+candidate_tool = "biome"
+candidate = "lint/correctness/noUnusedVariables"
+confidence = "exact"
+notes = "Equivalent core intent; options may still affect behavior."
+
+[[matching.rules]]
+baseline_tool = "eslint"
+baseline = "import-x/no-duplicates"
+candidate_tool = "biome"
+candidate = "lint/suspicious/noDuplicateImports"
+confidence = "approximate"
+
+[comparison]
+unsupported = "difference"
+
+# Deprecated, but still loaded as exact pairwise mappings.
 [[matching.aliases]]
 eslint = "no-unused-vars"
 biome = "lint/correctness/noUnusedVariables"
@@ -155,6 +199,12 @@ An explicit command is resolved first. Without one, Concord checks
 remain one process argument. Timeouts terminate the complete process group (a
 job object on Windows).
 
+Tool `include` narrows that tool's files, `exclude` produces `skipped`, and
+`unsupported` records an explicit unsupported capability. Empty lists preserve
+v0.1 behavior. Unknown capability is never converted to unsupported: Concord
+tries the tool. `comparison.unsupported` defaults to `difference`; the CLI
+override is `--unsupported-policy ignore|difference|error`.
+
 Discovery supports `.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`, `.tsx`, `.mts`,
 `.cts`, `.json` and `.jsonc`, respects `.gitignore`, and excludes `.git`,
 `node_modules`, `target`, `dist`, `build`, `coverage` and `.concord` by default.
@@ -162,7 +212,8 @@ Discovery supports `.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`, `.tsx`, `.mts`,
 ## Matching and metrics
 
 Rule names are reduced to kebab case after known namespaces are removed. A small
-built-in alias table maps common equivalents, and configuration can extend it.
+built-in catalog maps common equivalents. Explicit `matching.rules` entries are
+direction-independent and carry `exact` or `approximate` confidence.
 Diagnostics are first grouped by normalized path and canonical rule, then paired
 by position. Exact matching requires equal path, canonical rule, span, severity
 and message. Correlated diagnostics with a changed span, severity or message get
@@ -203,8 +254,14 @@ The project is one modular crate:
 - `reduce` implements cached, line-oriented delta debugging;
 - `cli` wires the commands to those layers and maps exit codes.
 
-JSON reports use `schemaVersion: 1`. Their arrays are sorted independently of
+JSON reports use `schemaVersion: 2`. Their arrays are sorted independently of
 the order in which tools or worker threads return results.
+
+Schema 2 contains the comparison plan, raw and comparable summaries, mapping
+coverage, separate unmapped arrays, formatter outcomes for both sides, and
+distinct unsupported/skipped/failed categories. See
+[`docs/schema-v2.md`](docs/schema-v2.md) and the
+[`schema 1 migration guide`](docs/migration-schema-v1-v2.md).
 
 Successful structured tool runs are represented through Concord's normalized
 model. Raw stdout and stderr are retained only when they are needed to diagnose
@@ -252,7 +309,7 @@ not install or require JavaScript tooling. `scripts/smoke-js.sh` and
 `scripts/smoke-js.ps1` are optional networked smoke tests with exact package
 versions.
 
-## v0.1 limitations
+## Limitations
 
 - Rule aliases are still incomplete.
 - A probable match does not mean semantic equivalence.

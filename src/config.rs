@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::capabilities::{CapabilityCatalog, UnsupportedPolicy};
 use crate::error::{ConcordError, Result};
+use crate::matching::MappingConfidence;
 use crate::model::Tool;
 
 pub const DEFAULT_CONFIG: &str = r#"# Concord configuration
@@ -21,6 +23,9 @@ formatter_jobs = 4
 # Uncomment a command to select an explicit executable.
 # [tools.eslint]
 # command = "/path/to/eslint"
+# include = ["**/*.js", "**/*.ts"]
+# exclude = ["**/generated/**"]
+# unsupported = []
 #
 # [tools.biome]
 # command = "/path/to/biome"
@@ -37,9 +42,21 @@ formatter_jobs = 4
 [matching]
 count_probable_as_match = false
 
+# [[matching.rules]]
+# baseline_tool = "eslint"
+# baseline = "@typescript-eslint/no-unused-vars"
+# candidate_tool = "biome"
+# candidate = "lint/correctness/noUnusedVariables"
+# confidence = "exact"
+# notes = "Equivalent core intent; options may still affect behavior."
+
+# Deprecated compatibility syntax:
 # [[matching.aliases]]
 # eslint = "@typescript-eslint/no-unused-vars"
 # biome = "lint/correctness/noUnusedVariables"
+
+[comparison]
+unsupported = "difference"
 "#;
 
 fn default_version() -> u32 {
@@ -54,6 +71,7 @@ pub struct Config {
     pub execution: ExecutionConfig,
     pub tools: ToolsConfig,
     pub matching: MatchingConfig,
+    pub comparison: ComparisonConfig,
 }
 
 impl Default for Config {
@@ -64,6 +82,7 @@ impl Default for Config {
             execution: ExecutionConfig::default(),
             tools: ToolsConfig::default(),
             matching: MatchingConfig::default(),
+            comparison: ComparisonConfig::default(),
         }
     }
 }
@@ -139,6 +158,23 @@ impl ToolsConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ToolConfig {
     pub command: Option<String>,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub unsupported: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ComparisonConfig {
+    pub unsupported: UnsupportedPolicy,
+}
+
+impl Default for ComparisonConfig {
+    fn default() -> Self {
+        Self {
+            unsupported: UnsupportedPolicy::Difference,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -146,6 +182,7 @@ pub struct ToolConfig {
 pub struct MatchingConfig {
     pub count_probable_as_match: bool,
     pub aliases: Vec<AliasConfig>,
+    pub rules: Vec<RuleMappingConfig>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -166,13 +203,37 @@ impl AliasConfig {
         .into_iter()
         .flatten()
     }
+
+    pub fn tool_values(&self) -> impl Iterator<Item = (Tool, &str)> {
+        [
+            (Tool::Eslint, self.eslint.as_deref()),
+            (Tool::Biome, self.biome.as_deref()),
+            (Tool::Oxlint, self.oxlint.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(tool, value)| value.map(|value| (tool, value)))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleMappingConfig {
+    pub baseline_tool: Tool,
+    pub baseline: String,
+    pub candidate_tool: Tool,
+    pub candidate: String,
+    pub confidence: MappingConfidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct LoadedConfig {
     pub config: Config,
+    pub capabilities: CapabilityCatalog,
     pub root: PathBuf,
     pub path: Option<PathBuf>,
+    pub warnings: Vec<String>,
 }
 
 pub fn load(explicit: Option<&Path>, cwd: &Path) -> Result<LoadedConfig> {
@@ -221,7 +282,74 @@ pub fn load(explicit: Option<&Path>, cwd: &Path) -> Result<LoadedConfig> {
     } else {
         Config::default()
     };
-    Ok(LoadedConfig { config, root, path })
+    validate_rule_mappings(&config)?;
+    let capabilities = CapabilityCatalog::new(&config)?;
+    let warnings = if config.matching.aliases.is_empty() {
+        Vec::new()
+    } else {
+        vec!["matching.aliases is deprecated; use matching.rules".into()]
+    };
+    Ok(LoadedConfig {
+        config,
+        capabilities,
+        root,
+        path,
+        warnings,
+    })
+}
+
+fn validate_rule_mappings(config: &Config) -> Result<()> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut pairs = BTreeSet::new();
+    let mut endpoints: BTreeMap<(Tool, String, Tool), String> = BTreeMap::new();
+    for mapping in &config.matching.rules {
+        if mapping.baseline_tool == mapping.candidate_tool {
+            return Err(ConcordError::usage(
+                "matching.rules cannot map a tool to itself",
+            ));
+        }
+        if !mapping.baseline_tool.is_linter() || !mapping.candidate_tool.is_linter() {
+            return Err(ConcordError::usage(
+                "matching.rules only supports eslint, biome, and oxlint",
+            ));
+        }
+        let baseline = mapping.baseline.trim();
+        let candidate = mapping.candidate.trim();
+        if baseline.is_empty() || candidate.is_empty() {
+            return Err(ConcordError::usage(
+                "matching.rules rule codes must not be empty",
+            ));
+        }
+        let mut pair = [
+            (mapping.baseline_tool, baseline.to_ascii_lowercase()),
+            (mapping.candidate_tool, candidate.to_ascii_lowercase()),
+        ];
+        pair.sort();
+        if !pairs.insert(pair.clone()) {
+            return Err(ConcordError::usage(format!(
+                "duplicate matching.rules mapping: {}:{} <-> {}:{}",
+                pair[0].0.config_key(),
+                pair[0].1,
+                pair[1].0.config_key(),
+                pair[1].1
+            )));
+        }
+        for ((tool, code), (other_tool, other_code)) in [(&pair[0], &pair[1]), (&pair[1], &pair[0])]
+        {
+            let key = (*tool, code.clone(), *other_tool);
+            if let Some(existing) = endpoints.insert(key, other_code.clone()) {
+                if existing != *other_code {
+                    return Err(ConcordError::usage(format!(
+                        "conflicting matching.rules mapping for {}:{}",
+                        tool.config_key(),
+                        code
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn init(path: &Path, force: bool) -> Result<()> {
@@ -241,7 +369,11 @@ pub fn init(path: &Path, force: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, DEFAULT_CONFIG};
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::{Config, DEFAULT_CONFIG, load};
 
     #[test]
     fn default_config_is_valid() {
@@ -254,5 +386,110 @@ mod tests {
         let error = toml::from_str::<Config>("version = 1\nmystery = true")
             .expect_err("unknown field should fail");
         assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn version_one_configuration_keeps_new_defaults() {
+        let config: Config = toml::from_str(
+            "version = 1\n[tools.eslint]\ncommand = \"eslint\"\n[matching]\ncount_probable_as_match = true\n",
+        )
+        .expect("v0.1 configuration");
+        assert!(config.tools.eslint.include.is_empty());
+        assert!(config.tools.eslint.exclude.is_empty());
+        assert!(config.tools.eslint.unsupported.is_empty());
+        assert!(config.matching.rules.is_empty());
+        assert_eq!(
+            config.comparison.unsupported,
+            crate::capabilities::UnsupportedPolicy::Difference
+        );
+    }
+
+    #[test]
+    fn real_v01_configuration_loads_without_changes() {
+        let config: Config = toml::from_str(include_str!("../tests/fixtures/config-v0.1.toml"))
+            .expect("v0.1 fixture");
+        assert_eq!(config.version, 1);
+        assert_eq!(config.tools.eslint.command.as_deref(), Some("eslint"));
+        assert!(config.matching.rules.is_empty());
+    }
+
+    #[test]
+    fn invalid_tool_glob_is_a_clear_configuration_error() {
+        let directory = tempdir().expect("tempdir");
+        fs::write(
+            directory.path().join("concord.toml"),
+            "version = 1\n[tools.biome]\nexclude = [\"[invalid\"]\n",
+        )
+        .expect("config");
+        let error = load(None, directory.path()).expect_err("invalid glob");
+        assert!(error.to_string().contains("tools.biome.exclude"));
+        assert!(error.to_string().contains("[invalid"));
+    }
+
+    #[test]
+    fn alias_deprecation_warning_is_stable() {
+        let directory = tempdir().expect("tempdir");
+        fs::write(
+            directory.path().join("concord.toml"),
+            "version = 1\n[[matching.aliases]]\neslint = \"no-debugger\"\nbiome = \"lint/suspicious/noDebugger\"\n",
+        )
+        .expect("config");
+        let loaded = load(None, directory.path()).expect("loaded config");
+        assert_eq!(
+            loaded.warnings,
+            ["matching.aliases is deprecated; use matching.rules"]
+        );
+    }
+
+    #[test]
+    fn duplicate_and_conflicting_rule_mappings_are_rejected() {
+        let duplicate = r#"
+version = 1
+[[matching.rules]]
+baseline_tool = "eslint"
+baseline = "a"
+candidate_tool = "biome"
+candidate = "b"
+confidence = "exact"
+[[matching.rules]]
+baseline_tool = "biome"
+baseline = "b"
+candidate_tool = "eslint"
+candidate = "a"
+confidence = "exact"
+"#;
+        let directory = tempdir().expect("tempdir");
+        fs::write(directory.path().join("concord.toml"), duplicate).expect("config");
+        assert!(
+            load(None, directory.path())
+                .expect_err("duplicate")
+                .to_string()
+                .contains("duplicate")
+        );
+
+        let conflict = duplicate.replace(
+            "baseline = \"b\"\ncandidate_tool = \"eslint\"\ncandidate = \"a\"",
+            "baseline = \"other\"\ncandidate_tool = \"eslint\"\ncandidate = \"a\"",
+        );
+        fs::write(directory.path().join("concord.toml"), conflict).expect("config");
+        assert!(
+            load(None, directory.path())
+                .expect_err("conflict")
+                .to_string()
+                .contains("conflicting")
+        );
+
+        let case_duplicate = duplicate.replacen(
+            "baseline = \"b\"\ncandidate_tool = \"eslint\"\ncandidate = \"a\"",
+            "baseline = \"B\"\ncandidate_tool = \"eslint\"\ncandidate = \"A\"",
+            1,
+        );
+        fs::write(directory.path().join("concord.toml"), case_duplicate).expect("config");
+        assert!(
+            load(None, directory.path())
+                .expect_err("case-insensitive duplicate")
+                .to_string()
+                .contains("duplicate")
+        );
     }
 }
