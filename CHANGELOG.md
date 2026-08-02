@@ -2,6 +2,37 @@
 
 All notable changes to Concord are documented here.
 
+## Unreleased
+
+### Added
+
+- Added capability-aware comparison planning.
+- Added `unsupported`, `skipped`, and `failed` as distinct outcomes.
+- Added per-tool include, exclude, and unsupported file patterns.
+- Added explicit rule mappings with exact and approximate confidence.
+- Added raw and comparable lint summaries.
+- Added the `concord plan` command.
+- Added the `--profile comparable` option.
+- Added atomic `--report-file` output.
+- Added JSON report schema version 2.
+
+### Changed
+
+- Unmapped lint diagnostics are now reported separately from mapped
+  baseline-only and candidate-only diagnostics.
+- Approximate rule mappings can no longer produce exact matches.
+- Formatter failures no longer include known unsupported files.
+- The report schema was upgraded from version 1 to version 2.
+
+### Deprecated
+
+- `matching.aliases` is deprecated in favor of `matching.rules`.
+
+### Compatibility
+
+- Existing `concord.toml` version 1 files remain supported.
+- Concord v0.1 report consumers must migrate to schema version 2.
+
 ## 0.1.2 - 2026-07-30
 
 ### Fixed
