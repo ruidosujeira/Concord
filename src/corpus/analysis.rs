@@ -342,19 +342,29 @@ impl<'a> SizeCache<'a> {
     }
 }
 
+/// A runner whose per-process timeout is the smaller of the configured
+/// per-process timeout and the entry budget. It is deliberately a constant
+/// rather than the remaining budget: a recorded timeout message must not
+/// depend on how much wall-clock time had already elapsed. The deadline check
+/// between steps is what abandons the entry, so the entry can overrun its
+/// budget by at most one process timeout, and that process is killed with its
+/// whole group.
 fn entry_runner(
     context: &AnalysisContext,
     root: &Path,
     deadline: Instant,
 ) -> std::result::Result<ProcessRunner, EntryError> {
-    let remaining = deadline.saturating_duration_since(Instant::now()).as_secs();
-    if remaining == 0 {
-        return Err(timeout());
-    }
+    check_deadline(deadline)?;
+    let seconds = context
+        .config
+        .execution
+        .timeout_seconds
+        .min(context.timeout.as_secs())
+        .max(1);
     Ok(ProcessRunner::new(
         root.to_path_buf(),
         context.config.clone(),
-        Some(remaining.min(context.config.execution.timeout_seconds.max(1))),
+        Some(seconds),
     ))
 }
 

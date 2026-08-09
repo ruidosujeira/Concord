@@ -108,7 +108,7 @@ impl PipelineReducer {
             self.baseline,
             self.candidate,
             &working,
-            Some(self.remaining(deadline)),
+            Some(self.process_timeout(task.timeout)),
         )
         .map_err(|error| format!("failed to locate the mismatch: {error}"))?;
         let index = signatures
@@ -132,7 +132,7 @@ impl PipelineReducer {
                 input: working,
                 output: Some(output.clone()),
                 mismatch: index,
-                timeout_seconds: Some(self.remaining(deadline)),
+                timeout_seconds: Some(self.process_timeout(task.timeout)),
                 deadline: Some(deadline),
             },
         )
@@ -155,12 +155,15 @@ impl PipelineReducer {
         })
     }
 
-    fn remaining(&self, deadline: Instant) -> u64 {
-        let remaining = deadline
-            .saturating_duration_since(Instant::now())
-            .as_secs()
-            .max(1);
-        remaining.min(self.config.execution.timeout_seconds.max(1))
+    /// Constant for the whole reduction, so that a recorded failure reason
+    /// never depends on elapsed wall-clock time. The deadline is what stops
+    /// the search.
+    fn process_timeout(&self, budget: Duration) -> u64 {
+        self.config
+            .execution
+            .timeout_seconds
+            .min(budget.as_secs())
+            .max(1)
     }
 }
 

@@ -163,17 +163,19 @@ pub fn run(loaded: &LoadedConfig, options: &CorpusOptions) -> Result<CorpusOutco
     pool.install(|| {
         pending.par_iter().for_each(|entry| {
             let identity = entry.identity.manifest_form();
-            let record = match acquired.roots.get(&identity) {
+            let root = acquired.roots.get(&identity);
+            let record = match root {
                 Some(root) => match analysis::analyze(&context, &identity, root) {
                     Ok(analysis) => analyzed(analysis),
-                    Err(error) => failed(error),
+                    Err(error) => failed(error.redacted(Some(root))),
                 },
                 None => failed(
                     acquired
                         .failures
                         .get(&identity)
                         .cloned()
-                        .unwrap_or_else(|| EntryError::acquisition("entry was not acquired")),
+                        .unwrap_or_else(|| EntryError::acquisition("entry was not acquired"))
+                        .redacted(None),
                 ),
             };
             let findings = record.findings.len();
