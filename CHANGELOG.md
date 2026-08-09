@@ -6,6 +6,19 @@ All notable changes to Concord are documented here.
 
 ### Added
 
+- Added the `concord corpus` command, which runs the existing differential
+  pipeline over many pinned projects declared in a manifest, in one
+  invocation.
+- Added a manifest format with `npm:`, `git:` and `path:` entries, all fully
+  pinned, whose parse errors are all reported together with line numbers.
+- Added a content-addressed cache for acquired entries, with integrity
+  verification of npm tarballs and traversal-guarded extraction.
+- Added project-independent finding fingerprints, deduplication across
+  projects, and ranking by affected project count.
+- Added optional reduction of one representative occurrence per finding group.
+- Added incremental run state that resumes an interrupted corpus run.
+- Added a deterministic corpus JSON artifact at `schemaVersion: 1` and a
+  human-readable corpus report.
 - Added capability-aware comparison planning.
 - Added `unsupported`, `skipped`, and `failed` as distinct outcomes.
 - Added per-tool include, exclude, and unsupported file patterns.
@@ -18,6 +31,8 @@ All notable changes to Concord are documented here.
 
 ### Changed
 
+- `ReductionRequest` gained an optional deadline that bounds the search
+  without changing the reduction algorithm; existing callers are unaffected.
 - Unmapped lint diagnostics are now reported separately from mapped
   baseline-only and candidate-only diagnostics.
 - Approximate rule mappings can no longer produce exact matches.
@@ -32,6 +47,9 @@ All notable changes to Concord are documented here.
 
 - Existing `concord.toml` version 1 files remain supported.
 - Concord v0.1 report consumers must migrate to schema version 2.
+- `init`, `doctor`, `plan`, `compare` and `reduce` keep their flags, output
+  and exit codes unchanged. The `2` and `3` exit codes of `corpus` describe
+  a whole run rather than a single comparison.
 
 ## 0.1.2 - 2026-07-30
 
