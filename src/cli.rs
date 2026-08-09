@@ -644,6 +644,7 @@ fn reduce_command(loaded: LoadedConfig, arguments: ReduceArgs) -> Result<Outcome
             .map(|path| absolute_from_root(&loaded.root, path)),
         mismatch: arguments.mismatch,
         timeout_seconds: arguments.timeout,
+        deadline: None,
     };
     let result = reduce(&loaded.root, &loaded.config, request)?;
     println!("{}", result.terminal_summary());
