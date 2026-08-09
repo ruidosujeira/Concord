@@ -120,7 +120,15 @@ pub fn run(loaded: &LoadedConfig, options: &CorpusOptions) -> Result<CorpusOutco
 
     let progress = Progress::new(options.quiet, manifest.entries.len());
     let acquired = acquire_all(&manifest.entries, &cache, options, &progress);
-    if acquired.roots.is_empty() {
+    // A run with nothing to analyze and nothing already recorded has failed as
+    // a whole. A fully resumed run still has its recorded results to report,
+    // even if re-acquiring every entry would fail now.
+    let recorded = manifest.entries.iter().any(|entry| {
+        run_state
+            .entries
+            .contains_key(&entry.identity.manifest_form())
+    });
+    if acquired.roots.is_empty() && !recorded {
         return Err(ConcordError::run_failure(
             "every corpus entry failed acquisition; no project could be analyzed",
         ));

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config::Config;
-use crate::error::{ConcordError, Result};
+use crate::error::Result;
 use crate::report::json;
 
 use super::entry::{EntryError, EntryStatus};
@@ -91,13 +91,6 @@ pub fn key(manifest: &Manifest, options: &super::CorpusOptions, config: &Config)
         serde_json::to_string(config).unwrap_or_default(),
     ];
     format!("{:x}", Sha256::digest(components.join("\u{1e}").as_bytes()))
-}
-
-pub fn unwritable(path: &Path, error: &std::io::Error) -> ConcordError {
-    ConcordError::run_failure(format!(
-        "failed to write run state\npath: {}\nerror: {error}",
-        path.display()
-    ))
 }
 
 #[cfg(test)]
