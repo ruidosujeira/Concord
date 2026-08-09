@@ -5,12 +5,14 @@ JavaScript and TypeScript linters and formatters. It runs existing tools,
 normalizes their structured output, matches diagnostics deterministically,
 reports useful metrics and can minimize a file that preserves a divergence.
 
-The v0.1 implementation supports:
+Concord supports:
 
 - linters: ESLint, Biome and Oxlint;
 - formatters: Prettier, Biome and Oxfmt;
 - terminal and schema-versioned JSON reports;
-- textual delta debugging for lint and format mismatches.
+- textual delta debugging for lint and format mismatches;
+- corpus runs over many pinned projects, with findings deduplicated across
+  them and ranked by how many projects each one affects.
 
 Concord never installs JavaScript tools. It prefers executables in the target
 project's `node_modules/.bin`, falls back to `PATH`, and accepts explicit
@@ -115,6 +117,19 @@ concord reduce \
   --baseline prettier \
   --candidate oxfmt \
   path/to/case.ts
+```
+
+Compare many projects in one pass and rank the divergences by how many of
+them are affected:
+
+```console
+concord corpus \
+  --mode lint \
+  --baseline eslint \
+  --candidate biome \
+  --reduce \
+  --json corpus.json \
+  corpus.txt
 ```
 
 Comparisons save JSON under `.concord/reports/` by default. Use
@@ -241,6 +256,271 @@ parser using the source filepath, and run each formatter a second time on its ow
 output. `--normalize-eol` equates only CRLF with LF for equality and idempotency;
 it does not ignore spaces, trailing newlines or any other differences.
 
+## Corpus runs
+
+`concord corpus` runs the same differential comparison over many projects in
+one invocation and returns one consolidated report in which findings are
+deduplicated across projects, ranked by how many projects they affect, and
+accompanied by one reproduction each.
+
+It changes nothing about what counts as a divergence. A corpus finding is
+exactly what `compare lint` and `compare format` already report as a
+difference, observed in one file of one project.
+
+### Manifest format
+
+Plain UTF-8 text, one entry per line, conventionally `corpus.txt`. Blank lines
+are ignored, and so is any line whose first non-whitespace character is `#`.
+Leading and trailing whitespace on an entry line is trimmed. Every entry
+carries a scheme prefix and is fully pinned.
+
+```text
+# The published tarball for that exact version.
+npm:lodash@4.17.21
+npm:@scope/name@1.2.3-alpha.1
+
+# The repository at that exact commit.
+git:https://github.com/acme/repo#0123456789abcdef0123456789abcdef01234567
+
+# A local directory, absolute or relative to this manifest file,
+# never to the process working directory.
+path:projects/alpha
+path:../sibling/project
+```
+
+A version range, a dist-tag or an omitted npm version is a parse error, and so
+is a branch, tag, short sha or omitted git ref: the manifest must be fully
+pinned. Every invalid line in a file is reported together, with its 1-based
+line number, the offending text and what was expected. Entries that resolve to
+the same project are collapsed with a warning on stderr, which is not an error.
+
+### Flags
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `<MANIFEST>` | — | Path to the manifest |
+| `--mode` | — | `lint` or `format` |
+| `--baseline` | — | Reference tool |
+| `--candidate` | — | Tool being evaluated |
+| `--profile` | `raw` | `comparable` drops divergences over unmapped rules |
+| `--normalize-eol` | off | Treat CRLF and LF as equal, in `format` mode |
+| `--cache-dir` | platform user cache directory, `concord` subdirectory | Acquired entries and run state |
+| `--registry` | `https://registry.npmjs.org` | npm registry |
+| `--refresh` | off | Discard and re-acquire cached entries |
+| `--jobs` | available parallelism | Entries analyzed concurrently |
+| `--timeout` | `300` | Seconds covering one entry's entire analysis |
+| `--acquire-timeout` | `120` | Seconds covering one entry's acquisition |
+| `--max-files-per-entry` | `2000` | Cap on files analyzed per entry |
+| `--reduce` | off | Minimize one representative occurrence per finding group |
+| `--reduce-timeout` | `120` | Seconds covering one group's reduction |
+| `--reduce-top` | all groups | Reduce only the N groups affecting the most projects |
+| `--no-resume` | off | Discard prior state and re-run every entry |
+| `--quiet` | off | Suppress progress on stderr |
+| `--json` | not written | Path for the machine-readable result |
+| `--output` | stdout | Path for the human-readable report |
+
+`--jobs 1` produces a fully sequential run. `--jobs` never affects results:
+any two job counts produce byte-identical JSON over the same corpus.
+
+### Acquisition and cache
+
+Entries are acquired before any analysis begins, so a network problem surfaces
+immediately rather than halfway through a long run. The cache is
+content-addressed by entry identity: npm entries under package name and exact
+version, git entries under repository URL and commit sha. A cached entry is
+reused with no network access at all. `path:` entries are never copied or
+cached; they are read in place and never modified.
+
+npm tarballs are fetched over HTTPS and verified against the `dist.integrity`
+value from the registry metadata; a mismatch, an absent value or an algorithm
+Concord cannot compute is an acquisition failure rather than an unverified
+download. Extraction rejects any member that would land outside the
+destination, including absolute paths and `..`, and skips links and devices
+outright. Git entries prefer a shallow fetch of the specific commit and fall
+back to a full clone plus checkout; submodules are never fetched.
+
+Every acquisition is retried twice on transport errors with exponential
+backoff. Integrity failures and 404s are not retried.
+
+Nothing acquired is ever executed. No install script runs, no package manager
+is invoked, no build step happens, and no project configuration is evaluated
+as code. Both tool executables are resolved once against the invocation's own
+project root and pinned as absolute commands, so an entry that ships its own
+`node_modules/.bin` can never be run. A corpus run uses one configuration —
+the `concord.toml` resolved for the invocation — and never reads configuration
+from inside an entry.
+
+### Fingerprints
+
+Every finding gets a fingerprint that is independent of project identity, file
+path, file name, line and column numbers, and any absolute path. It is the hex
+SHA-256 digest of these components joined with U+001E:
+
+1. the literal tag `concord-corpus-finding/1`;
+2. the mode, `lint` or `format`;
+3. the baseline tool key;
+4. the candidate tool key;
+5. the divergence category, as the existing comparison types name it:
+   `baseline_only`, `candidate_only`, `unmapped_baseline`,
+   `unmapped_candidate`, `probable_match`, `severity_changed`,
+   `range_changed`, `message_changed` for lint, and `different`,
+   `baseline_non_idempotent`, `candidate_non_idempotent`,
+   `both_non_idempotent` for format;
+6. the rule identity — the canonical rule code — or the empty string when the
+   divergence has none;
+7. the normalized shape of the disagreement.
+
+The shape is built so that the same structural divergence over different names
+or literals collapses to one group:
+
+- **format**: the added and removed lines of the unified diff, with file and
+  hunk headers dropped. Each line is reduced to a token stream in which every
+  distinct identifier becomes a positional placeholder (`$1`, `$2`, …),
+  string and template contents become `<str>`, numbers become `<num>`, and
+  runs of whitespace become a single `<sp>` or `<nl>`. Language keywords and
+  punctuation survive, so `a + b` and `a+b` remain distinct divergences while
+  `total + count` and `amount + size` do not.
+- **lint**: the severity of each side. The rule identity already names the
+  check, and messages embed per-occurrence identifiers, so they are not part
+  of the shape — except when there is no rule identity, or when the category
+  is `message_changed` and the message difference *is* the divergence. In
+  those cases the messages are folded in after collapsing quoted spans and
+  symbol-shaped words to `<name>` and numbers to `<num>`.
+
+Findings sharing a fingerprint form a group. The representative occurrence is
+chosen deterministically: smallest source file by byte length, ties broken by
+lexicographically smallest project identity, then by lexicographically
+smallest relative file path.
+
+### Reduction
+
+`--reduce` runs the existing reducer against exactly one representative
+occurrence per group, never against every occurrence. `--reduce-top <n>`
+limits it to the n groups affecting the most projects, with ties broken by
+fingerprint.
+
+The representative file is copied into a scratch directory and reduced there,
+so a `path:` entry is never written to. The project root is still what the
+tools run against, exactly as in a single-project run; a tool that writes to
+its own working directory does so as it always would.
+
+On timeout or reducer failure the group keeps its unreduced representative and
+records that reduction did not complete, with the reason.
+
+### Resume
+
+Run state is written under the cache root after each entry completes, to a
+temporary file that is then renamed, so an interruption cannot leave a
+truncated state file. It is keyed by a digest of the resolved manifest, the
+Concord version, the mode, the tool pair, the profile, `--max-files-per-entry`,
+`--normalize-eol`, `--timeout`, `--registry` and the whole resolved
+`concord.toml`. Changing any of those starts a fresh run rather than resuming
+an incompatible one; changing `--jobs`, `--cache-dir`, `--quiet`, the output
+destinations or the reduction flags does not.
+
+Completed entries are skipped on the next invocation and their recorded
+results are merged with the newly analyzed ones, so a run resumed after an
+interruption produces the same report as an uninterrupted one. Entries that
+failed are recorded too, so a resumed run does not silently change its result
+by retrying them; `--no-resume` forces a full re-run and `--refresh`
+re-acquires the entries.
+
+### JSON schema
+
+`--json <path>` writes `schemaVersion: 1`. Field names are camelCase, matching
+every other Concord report. The artifact is deterministic across runs over an
+unchanged corpus: no timestamps, no wall-clock durations, no absolute paths,
+no host or user names, no nondeterministic iteration order.
+
+```jsonc
+{
+  "schemaVersion": 1,
+  "concordVersion": "0.2.0-alpha.1",
+  "configuration": {              // only what affects results
+    "mode": "lint",
+    "baselineTool": "eslint",
+    "candidateTool": "biome",
+    "profile": "raw",
+    "normalizeEol": false,
+    "countProbableAsMatch": false,
+    "maxFilesPerEntry": 2000,
+    "entryTimeoutSeconds": 300,
+    "acquireTimeoutSeconds": 120,
+    "registry": "https://registry.npmjs.org",
+    "reduce": true,
+    "reduceTop": 20,              // present only with --reduce
+    "reduceTimeoutSeconds": 120   // present only with --reduce
+  },
+  "summary": {
+    "entriesTotal": 4, "entriesAnalyzed": 3, "entriesFailed": 1,
+    "entriesTruncated": 0, "distinctFindings": 2, "totalOccurrences": 3
+  },
+  "entries": [                    // sorted by project identity
+    {
+      "project": "path:projects/alpha",   // always the manifest form
+      "scheme": "path",
+      "status": "analyzed",               // or "failed"
+      "filesDiscovered": 12,
+      "filesAnalyzed": 12,
+      "truncated": false,
+      "maxFilesPerEntry": 2000,           // present only when truncated
+      "occurrences": 1
+    }
+  ],
+  "entryErrors": [                // sorted by kind, then project identity
+    {
+      "project": "path:projects/docs-only",
+      "kind": "no_analyzable_files",
+      "message": "no file matches the configured discovery patterns"
+    }
+  ],
+  "findings": [                   // affected projects desc, occurrences desc,
+    {                             // then fingerprint asc
+      "fingerprint": "88f35ea8…",
+      "baselineTool": "eslint",
+      "candidateTool": "biome",
+      "category": "baseline_only",
+      "rule": "no-unused-vars",   // absent when the divergence has none
+      "occurrences": 2,
+      "affectedProjects": 2,
+      "projects": ["path:projects/alpha", "path:projects/beta"],
+      "representative": {
+        "project": "path:projects/beta",
+        "path": "index.ts",       // relative, forward slashes on every platform
+        "fileBytes": 68,
+        "detail": "baseline_only (baseline)\n  rule: no-unused-vars\n  …"
+      },
+      "reduction": {              // present only for a reduced group
+        "completed": true,
+        "reason": "…",            // present only when it did not complete
+        "source": "…",            // the minimal reproduction
+        "originalBytes": 68, "reducedBytes": 32, "attempts": 2
+      }
+    }
+  ]
+}
+```
+
+Entry error kinds are `acquisition`, `unreadable`, `no_analyzable_files`,
+`tool_failure`, `not_utf8`, `timeout` and `panic`. Their messages have the
+project root replaced by `<project>` and any other absolute path by `<path>`.
+A reduced `source` is reproduced verbatim, so a project whose own source
+contains an absolute path will contain it there too.
+
+### Corpus exit codes
+
+| Code | Meaning |
+| ---: | --- |
+| `0` | The run completed and produced no finding |
+| `1` | The run completed and produced at least one finding |
+| `2` | The run itself failed: unreadable, invalid or empty manifest, unusable cache directory, every entry failed acquisition, or an unwritable output path |
+| `3` | The run completed, at least one entry failed, and there is no finding |
+
+An entry-level failure never turns a findings-present run into anything other
+than `1`. Progress and diagnostics go to stderr and are never interleaved with
+report content; progress is suppressed when stderr is not a terminal or when
+`--quiet` is passed.
+
 ## Architecture
 
 The project is one modular crate:
@@ -252,6 +532,8 @@ The project is one modular crate:
   comparison;
 - `report` renders terminal, JSON and unified diffs;
 - `reduce` implements cached, line-oriented delta debugging;
+- `corpus` acquires many pinned projects, runs that pipeline over each of
+  them, and fingerprints and groups the findings;
 - `cli` wires the commands to those layers and maps exit codes.
 
 JSON reports use `schemaVersion: 2`. Their arrays are sorted independently of
@@ -288,7 +570,9 @@ Biome diagnostic normalization and reducer target drift.
 | `3` | Missing tool, timeout, crash, invalid output or other operational failure |
 
 `doctor` lists missing optional tools without failing. It returns `3` when a
-tool explicitly configured in `concord.toml` cannot be used.
+tool explicitly configured in `concord.toml` cannot be used. `corpus` reports
+run-level failures with `2` and partial failures with `3`; see
+[Corpus exit codes](#corpus-exit-codes).
 
 ## Development
 
@@ -301,6 +585,7 @@ cargo run -- init --help
 cargo run -- compare lint --help
 cargo run -- compare format --help
 cargo run -- reduce --help
+cargo run -- corpus --help
 cargo run -- doctor
 ```
 
@@ -318,6 +603,12 @@ versions.
   differences.
 - Concord compares observed results; it does not prove mathematical
   equivalence.
+- A corpus run analyzes acquired projects as data. It does not install their
+  dependencies, so a project's own linter plugins and configuration are not in
+  play and its divergences are those of the configuration Concord was invoked
+  with.
+- Formatter non-idempotency findings carry no textual shape, so they group by
+  category and tool pair alone.
 - Structured reporter formats can change across major tool releases; invalid
   or unsupported output is reported as an operational failure.
 

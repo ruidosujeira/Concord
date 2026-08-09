@@ -11,7 +11,9 @@ use tempfile::Builder;
 use crate::adapters::{FormatterAdapter, compare_format_file, run_linter};
 use crate::config::Config;
 use crate::error::{ConcordError, Result};
-use crate::matching::{AliasTable, MatchKind, RuleMappingTable, compare_with_mappings};
+use crate::matching::{
+    AliasTable, DiagnosticMatch, MatchKind, MatchResult, RuleMappingTable, compare_with_mappings,
+};
 use crate::model::{Diagnostic, Severity, Tool};
 use crate::process::ProcessRunner;
 use crate::report::{FormatComparisonStatus, REPORT_SCHEMA_VERSION};
@@ -32,6 +34,11 @@ pub struct ReductionRequest {
     pub output: Option<PathBuf>,
     pub mismatch: usize,
     pub timeout_seconds: Option<u64>,
+    /// Optional wall-clock bound on the search. Once it passes, no further
+    /// candidate is accepted, so the search settles on the smallest
+    /// reproduction found so far instead of running unbounded. `None` keeps
+    /// the search unbounded.
+    pub deadline: Option<Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,6 +177,96 @@ pub fn reduce(root: &Path, config: &Config, request: ReductionRequest) -> Result
     })
 }
 
+/// Enumerate the mismatches of one comparison, in the order that
+/// `concord reduce --mismatch <index>` indexes them.
+pub fn mismatch_signatures(
+    root: &Path,
+    config: &Config,
+    mode: ReduceMode,
+    baseline: Tool,
+    candidate: Tool,
+    input: &Path,
+    timeout_seconds: Option<u64>,
+) -> Result<Vec<MismatchSignature>> {
+    let runner = ProcessRunner::new(root.to_path_buf(), config.clone(), timeout_seconds);
+    let aliases = AliasTable::new(&config.matching.aliases);
+    let mappings = RuleMappingTable::new(&config.matching.rules, &config.matching.aliases);
+    let predicate = Predicate::untargeted(
+        root,
+        runner,
+        aliases,
+        mappings,
+        mode,
+        baseline,
+        candidate,
+        input.to_path_buf(),
+        None,
+    )?;
+    predicate.current_signatures()
+}
+
+/// The mismatches of a lint comparison, in reduction index order.
+pub fn lint_mismatch_signatures(result: MatchResult) -> Vec<MismatchSignature> {
+    let mut signatures = Vec::new();
+    signatures.extend(
+        result
+            .baseline_only
+            .into_iter()
+            .map(|diagnostic| unmatched_signature("baseline", diagnostic)),
+    );
+    signatures.extend(
+        result
+            .candidate_only
+            .into_iter()
+            .map(|diagnostic| unmatched_signature("candidate", diagnostic)),
+    );
+    signatures.extend(
+        result
+            .unmapped_baseline
+            .into_iter()
+            .map(|diagnostic| unmatched_signature("unmapped_baseline", diagnostic)),
+    );
+    signatures.extend(
+        result
+            .unmapped_candidate
+            .into_iter()
+            .map(|diagnostic| unmatched_signature("unmapped_candidate", diagnostic)),
+    );
+    signatures.extend(
+        result
+            .matches
+            .into_iter()
+            .filter(|item| item.kind != MatchKind::ExactMatch)
+            .map(correlated_signature),
+    );
+    signatures
+}
+
+/// The mismatch of a formatter comparison, if the comparison found one.
+pub fn format_mismatch_signature(status: FormatComparisonStatus) -> Option<MismatchSignature> {
+    (status != FormatComparisonStatus::Identical).then(|| MismatchSignature {
+        side: "both".into(),
+        category: format_status_name(status).into(),
+        canonical_code: None,
+        baseline: None,
+        candidate: None,
+    })
+}
+
+fn correlated_signature(item: DiagnosticMatch) -> MismatchSignature {
+    MismatchSignature {
+        side: "both".into(),
+        category: match_kind_name(item.kind).into(),
+        canonical_code: item
+            .baseline
+            .canonical_code
+            .clone()
+            .or(item.candidate.canonical_code.clone()),
+        baseline: Some(diagnostic_signature(&item.baseline)),
+        candidate: Some(diagnostic_signature(&item.candidate)),
+    }
+}
+
 struct Predicate<'a> {
     root: &'a Path,
     runner: ProcessRunner,
@@ -180,6 +277,7 @@ struct Predicate<'a> {
     candidate: Tool,
     temp_path: PathBuf,
     signature: MismatchSignature,
+    deadline: Option<Instant>,
     baseline_formatter: Option<FormatterAdapter>,
     candidate_formatter: Option<FormatterAdapter>,
 }
@@ -193,33 +291,17 @@ impl<'a> Predicate<'a> {
         request: &ReductionRequest,
         temp_path: PathBuf,
     ) -> Result<Self> {
-        let (baseline_formatter, candidate_formatter) = if request.mode == ReduceMode::Format {
-            (
-                Some(FormatterAdapter::resolve(&runner, request.baseline)?),
-                Some(FormatterAdapter::resolve(&runner, request.candidate)?),
-            )
-        } else {
-            (None, None)
-        };
-        let mut predicate = Self {
+        let mut predicate = Self::untargeted(
             root,
             runner,
             aliases,
             mappings,
-            mode: request.mode,
-            baseline: request.baseline,
-            candidate: request.candidate,
+            request.mode,
+            request.baseline,
+            request.candidate,
             temp_path,
-            signature: MismatchSignature {
-                side: String::new(),
-                category: String::new(),
-                canonical_code: None,
-                baseline: None,
-                candidate: None,
-            },
-            baseline_formatter,
-            candidate_formatter,
-        };
+            request.deadline,
+        )?;
         let signatures = predicate.current_signatures()?;
         predicate.signature = signatures.get(request.mismatch).cloned().ok_or_else(|| {
             ConcordError::usage(format!(
@@ -231,7 +313,55 @@ impl<'a> Predicate<'a> {
         Ok(predicate)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn untargeted(
+        root: &'a Path,
+        runner: ProcessRunner,
+        aliases: AliasTable,
+        mappings: RuleMappingTable,
+        mode: ReduceMode,
+        baseline: Tool,
+        candidate: Tool,
+        temp_path: PathBuf,
+        deadline: Option<Instant>,
+    ) -> Result<Self> {
+        let (baseline_formatter, candidate_formatter) = if mode == ReduceMode::Format {
+            (
+                Some(FormatterAdapter::resolve(&runner, baseline)?),
+                Some(FormatterAdapter::resolve(&runner, candidate)?),
+            )
+        } else {
+            (None, None)
+        };
+        Ok(Self {
+            root,
+            runner,
+            aliases,
+            mappings,
+            mode,
+            baseline,
+            candidate,
+            temp_path,
+            signature: MismatchSignature {
+                side: String::new(),
+                category: String::new(),
+                canonical_code: None,
+                baseline: None,
+                candidate: None,
+            },
+            deadline,
+            baseline_formatter,
+            candidate_formatter,
+        })
+    }
+
     fn preserves(&self, content: &str) -> bool {
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return false;
+        }
         self.verify(content).unwrap_or(false)
     }
 
@@ -273,49 +403,7 @@ impl<'a> Predicate<'a> {
             self.baseline,
             self.candidate,
         );
-        let mut signatures = Vec::new();
-        signatures.extend(
-            result
-                .baseline_only
-                .into_iter()
-                .map(|diagnostic| unmatched_signature("baseline", diagnostic)),
-        );
-        signatures.extend(
-            result
-                .candidate_only
-                .into_iter()
-                .map(|diagnostic| unmatched_signature("candidate", diagnostic)),
-        );
-        signatures.extend(
-            result
-                .unmapped_baseline
-                .into_iter()
-                .map(|diagnostic| unmatched_signature("unmapped_baseline", diagnostic)),
-        );
-        signatures.extend(
-            result
-                .unmapped_candidate
-                .into_iter()
-                .map(|diagnostic| unmatched_signature("unmapped_candidate", diagnostic)),
-        );
-        signatures.extend(
-            result
-                .matches
-                .into_iter()
-                .filter(|item| item.kind != MatchKind::ExactMatch)
-                .map(|item| MismatchSignature {
-                    side: "both".into(),
-                    category: match_kind_name(item.kind).into(),
-                    canonical_code: item
-                        .baseline
-                        .canonical_code
-                        .clone()
-                        .or(item.candidate.canonical_code.clone()),
-                    baseline: Some(diagnostic_signature(&item.baseline)),
-                    candidate: Some(diagnostic_signature(&item.candidate)),
-                }),
-        );
-        Ok(signatures)
+        Ok(lint_mismatch_signatures(result))
     }
 
     fn format_signatures(&self) -> Result<Vec<MismatchSignature>> {
@@ -347,20 +435,13 @@ impl<'a> Predicate<'a> {
                 "a formatter failed while evaluating the reduction",
             ));
         }
-        if result.status == FormatComparisonStatus::Identical {
-            return Ok(Vec::new());
-        }
-        Ok(vec![MismatchSignature {
-            side: "both".into(),
-            category: format_status_name(result.status).into(),
-            canonical_code: None,
-            baseline: None,
-            candidate: None,
-        }])
+        Ok(format_mismatch_signature(result.status)
+            .into_iter()
+            .collect())
     }
 }
 
-fn unmatched_signature(side: &str, diagnostic: Diagnostic) -> MismatchSignature {
+pub(crate) fn unmatched_signature(side: &str, diagnostic: Diagnostic) -> MismatchSignature {
     let canonical_code = diagnostic.canonical_code.clone();
     let identity = diagnostic_signature(&diagnostic);
     let (baseline, candidate) = if side.ends_with("baseline") || side == "baseline" {

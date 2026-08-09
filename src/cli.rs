@@ -9,6 +9,7 @@ use rayon::prelude::*;
 use crate::adapters::{FormatterAdapter, compare_format_file, run_linter};
 use crate::capabilities::{ComparisonPlan, ToolAvailability, UnsupportedPolicy};
 use crate::config::{self, LoadedConfig};
+use crate::corpus;
 use crate::discovery::discover_excluding;
 use crate::error::{ConcordError, ErrorKind, Result};
 use crate::matching::{AliasTable, RuleMappingTable, compare_with_mappings};
@@ -49,6 +50,8 @@ pub enum Command {
     Compare(CompareArgs),
     /// Minimize a file while preserving a selected mismatch
     Reduce(ReduceArgs),
+    /// Compare many projects declared in a manifest in one pass
+    Corpus(CorpusArgs),
 }
 
 #[derive(Debug, Args)]
@@ -248,10 +251,81 @@ pub struct ReduceArgs {
     pub no_save_report: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct CorpusArgs {
+    /// Manifest listing one pinned project per line
+    #[arg(value_name = "MANIFEST")]
+    pub manifest: PathBuf,
+    /// Kind of comparison to run against every project
+    #[arg(long, value_enum)]
+    pub mode: ReduceModeArg,
+    /// Reference tool
+    #[arg(long)]
+    pub baseline: Tool,
+    /// Tool being evaluated
+    #[arg(long)]
+    pub candidate: Tool,
+    /// Select raw or mapped-rule comparable divergences
+    #[arg(long, value_enum, default_value = "raw")]
+    pub profile: ComparisonProfile,
+    /// Treat CRLF and LF as equal in format mode
+    #[arg(long)]
+    pub normalize_eol: bool,
+    /// Directory for acquired entries and run state
+    #[arg(long, value_name = "PATH")]
+    pub cache_dir: Option<PathBuf>,
+    /// npm registry used to acquire npm entries
+    #[arg(long, value_name = "URL", default_value = corpus::acquire::DEFAULT_REGISTRY)]
+    pub registry: String,
+    /// Discard and re-acquire cached entries for this manifest
+    #[arg(long)]
+    pub refresh: bool,
+    /// Entries analyzed concurrently
+    #[arg(long, value_name = "N", default_value_t = default_jobs())]
+    pub jobs: usize,
+    /// Budget for one entry's entire analysis, in seconds
+    #[arg(long, value_name = "SECONDS", default_value_t = 300)]
+    pub timeout: u64,
+    /// Budget for acquiring one entry, in seconds
+    #[arg(long, value_name = "SECONDS", default_value_t = 120)]
+    pub acquire_timeout: u64,
+    /// Most files analyzed per entry
+    #[arg(long, value_name = "N", default_value_t = 2_000)]
+    pub max_files_per_entry: usize,
+    /// Minimize one representative occurrence per finding group
+    #[arg(long)]
+    pub reduce: bool,
+    /// Budget for reducing one finding group, in seconds
+    #[arg(long, value_name = "SECONDS", default_value_t = 120)]
+    pub reduce_timeout: u64,
+    /// Reduce only the N groups affecting the most projects
+    #[arg(long, value_name = "N")]
+    pub reduce_top: Option<usize>,
+    /// Ignore and discard any recorded state for this run
+    #[arg(long)]
+    pub no_resume: bool,
+    /// Suppress progress on stderr
+    #[arg(long)]
+    pub quiet: bool,
+    /// Write the machine-readable result to this path
+    #[arg(long, value_name = "PATH")]
+    pub json: Option<PathBuf>,
+    /// Write the human-readable report to this path instead of stdout
+    #[arg(long, value_name = "PATH")]
+    pub output: Option<PathBuf>,
+}
+
+fn default_jobs() -> usize {
+    thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Clean,
     Differences,
+    /// A multi-project run completed, at least one entry failed, and no
+    /// finding was produced.
+    PartialFailure,
 }
 
 pub fn run(cli: Cli) -> Result<Outcome> {
@@ -287,6 +361,53 @@ pub fn run(cli: Cli) -> Result<Outcome> {
             let loaded = load_with_warnings(cli.config.as_deref(), &cwd)?;
             reduce_command(loaded, arguments)
         }
+        Command::Corpus(arguments) => {
+            let loaded = load_with_warnings(cli.config.as_deref(), &cwd)?;
+            corpus_command(&loaded, arguments, &cwd)
+        }
+    }
+}
+
+fn corpus_command(loaded: &LoadedConfig, arguments: CorpusArgs, cwd: &Path) -> Result<Outcome> {
+    let options = corpus::CorpusOptions {
+        manifest: absolute_from(cwd, arguments.manifest),
+        mode: match arguments.mode {
+            ReduceModeArg::Lint => ReduceMode::Lint,
+            ReduceModeArg::Format => ReduceMode::Format,
+        },
+        baseline: arguments.baseline,
+        candidate: arguments.candidate,
+        profile: arguments.profile,
+        normalize_eol: arguments.normalize_eol,
+        cache_dir: arguments.cache_dir.map(|path| absolute_from(cwd, path)),
+        registry: arguments.registry,
+        refresh: arguments.refresh,
+        jobs: arguments.jobs,
+        timeout: arguments.timeout,
+        acquire_timeout: arguments.acquire_timeout,
+        max_files_per_entry: arguments.max_files_per_entry,
+        reduce: arguments.reduce,
+        reduce_timeout: arguments.reduce_timeout,
+        reduce_top: arguments.reduce_top,
+        no_resume: arguments.no_resume,
+        quiet: arguments.quiet,
+        json: arguments.json.map(|path| absolute_from(cwd, path)),
+        output: arguments.output.map(|path| absolute_from(cwd, path)),
+    };
+    match corpus::run(loaded, &options)? {
+        corpus::CorpusOutcome::Clean => Ok(Outcome::Clean),
+        corpus::CorpusOutcome::Findings => Ok(Outcome::Differences),
+        corpus::CorpusOutcome::PartialFailure => Ok(Outcome::PartialFailure),
+    }
+}
+
+/// Corpus paths are relative to the working directory, not to the project root
+/// that `concord.toml` establishes.
+fn absolute_from(base: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
     }
 }
 
@@ -644,6 +765,7 @@ fn reduce_command(loaded: LoadedConfig, arguments: ReduceArgs) -> Result<Outcome
             .map(|path| absolute_from_root(&loaded.root, path)),
         mismatch: arguments.mismatch,
         timeout_seconds: arguments.timeout,
+        deadline: None,
     };
     let result = reduce(&loaded.root, &loaded.config, request)?;
     println!("{}", result.terminal_summary());
@@ -797,7 +919,8 @@ pub fn exit_code(result: &Result<Outcome>) -> u8 {
     match result {
         Ok(Outcome::Clean) => 0,
         Ok(Outcome::Differences) => 1,
-        Err(error) if error.kind == ErrorKind::Usage => 2,
+        Ok(Outcome::PartialFailure) => 3,
+        Err(error) if matches!(error.kind, ErrorKind::Usage | ErrorKind::RunFailure) => 2,
         Err(_) => 3,
     }
 }

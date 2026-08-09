@@ -2,6 +2,7 @@ pub mod adapters;
 pub mod capabilities;
 pub mod cli;
 pub mod config;
+pub mod corpus;
 pub mod discovery;
 pub mod error;
 pub mod matching;
