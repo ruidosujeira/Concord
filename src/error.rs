@@ -8,6 +8,11 @@ pub type Result<T> = std::result::Result<T, ConcordError>;
 pub enum ErrorKind {
     Usage,
     Operational,
+    /// A multi-project run could not start or could not produce a result at
+    /// all. Reported with the same exit code as `Usage` because the causes are
+    /// equivalent from the caller's point of view: the invocation cannot
+    /// produce a report and retrying it unchanged cannot help.
+    RunFailure,
 }
 
 #[derive(Debug, Error)]
@@ -28,6 +33,13 @@ impl ConcordError {
     pub fn operational(message: impl Into<String>) -> Self {
         Self {
             kind: ErrorKind::Operational,
+            message: message.into(),
+        }
+    }
+
+    pub fn run_failure(message: impl Into<String>) -> Self {
+        Self {
+            kind: ErrorKind::RunFailure,
             message: message.into(),
         }
     }
