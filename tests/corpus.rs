@@ -2,9 +2,9 @@
 //! Corpus integration tests.
 //!
 //! Every test here uses fixture project directories checked into the
-//! repository and the local fake tool. Nothing reaches the network: the one
-//! test that exercises a registry failure serves it from a loopback listener
-//! the test itself binds.
+//! repository and the local fake tool. Nothing reaches the network: the tests
+//! that exercise npm acquisition serve the registry and the tarball from a
+//! loopback listener the test itself binds.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -788,7 +788,7 @@ fn a_reduction_that_cannot_finish_keeps_the_unreduced_representative() {
 fn an_unavailable_npm_version_fails_only_its_own_entry() {
     let directory = workspace(&["eslint", "biome"], &["alpha"]);
     let path = directory.path();
-    let registry = NotFoundRegistry::start();
+    let registry = LocalRegistry::start(Vec::new());
     let name = manifest(
         path,
         "corpus.txt",
@@ -820,41 +820,240 @@ fn an_unavailable_npm_version_fails_only_its_own_entry() {
     assert_eq!(registry.requests(), 1, "a 404 must not be retried");
 }
 
-/// A loopback listener that answers every request with 404, standing in for a
-/// registry that does not have the requested version.
-struct NotFoundRegistry {
-    url: String,
-    counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+#[test]
+fn an_npm_entry_is_verified_extracted_and_then_served_from_the_cache() {
+    let directory = workspace(&["eslint", "biome"], &[]);
+    let path = directory.path();
+    let tarball = tarball(&[(
+        "package/index.ts",
+        b"const userTryingToGet = getUser();\n" as &[u8],
+    )]);
+    let registry = LocalRegistry::start(npm_routes(&tarball, &integrity(&tarball)));
+    let name = manifest(path, "corpus.txt", "npm:demo-package@1.0.0\n");
+    let arguments = |json: &str| {
+        vec![
+            "--registry".to_owned(),
+            registry.url.clone(),
+            "--json".to_owned(),
+            json.to_owned(),
+            "--output".to_owned(),
+            format!("{json}.txt"),
+            name.clone(),
+        ]
+    };
+    let first = arguments("first.json");
+    let output = lint_run(path, &first.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+
+    let report = json_at(path, "first.json");
+    assert_eq!(report["entries"][0]["project"], "npm:demo-package@1.0.0");
+    assert_eq!(report["entries"][0]["status"], "analyzed");
+    assert_eq!(report["findings"][0]["representative"]["path"], "index.ts");
+    assert!(
+        path.join("cache/npm/demo-package/1.0.0/index.ts").is_file(),
+        "the entry is cached under its package name and exact version"
+    );
+    let served = registry.requests();
+    assert_eq!(served, 2, "one metadata request and one tarball request");
+
+    // A second run reaches the registry not at all, even after it stops
+    // answering.
+    registry.stop();
+    let second = arguments("second.json");
+    let output = lint_run(
+        path,
+        &["--no-resume"]
+            .into_iter()
+            .chain(second.iter().map(String::as_str))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert_eq!(
+        registry.requests(),
+        served,
+        "a cached entry must be reused without any network access"
+    );
+    assert_eq!(
+        fs::read(path.join("first.json")).expect("first artifact"),
+        fs::read(path.join("second.json")).expect("second artifact")
+    );
 }
 
-impl NotFoundRegistry {
-    fn start() -> Self {
+#[test]
+fn a_tarball_failing_its_integrity_check_is_not_used() {
+    let directory = workspace(&["eslint", "biome"], &["alpha"]);
+    let path = directory.path();
+    let tarball = tarball(&[(
+        "package/index.ts",
+        b"const userTryingToGet = getUser();\n" as &[u8],
+    )]);
+    let registry = LocalRegistry::start(npm_routes(
+        &tarball,
+        &integrity(b"a completely different payload"),
+    ));
+    let name = manifest(
+        path,
+        "corpus.txt",
+        "npm:demo-package@1.0.0\npath:projects/alpha\n",
+    );
+    let output = lint_run(
+        path,
+        &["--registry", &registry.url, "--json", "result.json", &name],
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+
+    let report = json_at(path, "result.json");
+    let error = &report["entryErrors"][0];
+    assert_eq!(error["project"], "npm:demo-package@1.0.0");
+    assert_eq!(error["kind"], "acquisition");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("integrity mismatch")),
+        "{error}"
+    );
+    assert!(
+        !path.join("cache/npm/demo-package/1.0.0").exists(),
+        "an unverified tarball must not reach the cache"
+    );
+    // The other entry still completed.
+    assert_eq!(report["summary"]["entriesAnalyzed"], 1);
+    assert_eq!(
+        registry.requests(),
+        2,
+        "an integrity failure must not be retried"
+    );
+}
+
+fn tarball(members: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for (name, data) in members {
+        let mut header = tar::Header::new_ustar();
+        header.set_path(name).expect("member path");
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        builder.append(&header, *data).expect("append member");
+    }
+    let bytes = builder.into_inner().expect("tar bytes");
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(&bytes).expect("compress");
+    encoder.finish().expect("gzip bytes")
+}
+
+fn integrity(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha512};
+
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let digest = Sha512::digest(bytes);
+    let mut encoded = String::new();
+    for chunk in digest.chunks(3) {
+        let mut buffer = [0u8; 3];
+        buffer[..chunk.len()].copy_from_slice(chunk);
+        let value =
+            (u32::from(buffer[0]) << 16) | (u32::from(buffer[1]) << 8) | u32::from(buffer[2]);
+        for offset in 0..4 {
+            if offset <= chunk.len() {
+                encoded.push(char::from(
+                    ALPHABET[((value >> (18 - offset * 6)) & 0x3f) as usize],
+                ));
+            } else {
+                encoded.push('=');
+            }
+        }
+    }
+    format!("sha512-{encoded}")
+}
+
+fn npm_routes(tarball: &[u8], integrity: &str) -> Vec<(String, u16, Vec<u8>)> {
+    let tarball_path = "/demo-package/-/demo-package-1.0.0.tgz";
+    let metadata = format!(
+        "{{\"name\":\"demo-package\",\"version\":\"1.0.0\",\
+          \"dist\":{{\"tarball\":\"REGISTRY{tarball_path}\",\"integrity\":\"{integrity}\"}}}}"
+    );
+    vec![
+        ("/demo-package/1.0.0".to_owned(), 200, metadata.into_bytes()),
+        (tarball_path.to_owned(), 200, tarball.to_vec()),
+    ]
+}
+
+/// A loopback HTTP server standing in for a registry. Routes are exact paths;
+/// anything else answers 404. `REGISTRY` inside a body is replaced by the
+/// server's own base URL once it is known.
+struct LocalRegistry {
+    url: String,
+    counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl LocalRegistry {
+    fn start(routes: Vec<(String, u16, Vec<u8>)>) -> Self {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback listener");
         let address = listener.local_addr().expect("listener address");
-        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let served = std::sync::Arc::clone(&counter);
+        let url = format!("http://{address}");
+        let routes: Vec<(String, u16, Vec<u8>)> = routes
+            .into_iter()
+            .map(|(path, status, body)| {
+                let body = String::from_utf8(body.clone())
+                    .map(|text| text.replace("REGISTRY", &url).into_bytes())
+                    .unwrap_or(body);
+                (path, status, body)
+            })
+            .collect();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let served = Arc::clone(&counter);
+        let stopped = Arc::clone(&stop);
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
-                served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-                let mut line = String::new();
-                while reader.read_line(&mut line).unwrap_or(0) > 0 {
-                    if line == "\r\n" || line == "\n" {
+                if stopped.load(Ordering::SeqCst) {
+                    break;
+                }
+                served.fetch_add(1, Ordering::SeqCst);
+                let Ok(clone) = stream.try_clone() else {
+                    continue;
+                };
+                let mut reader = BufReader::new(clone);
+                let mut request = String::new();
+                if reader.read_line(&mut request).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let mut header = String::new();
+                while reader.read_line(&mut header).unwrap_or(0) > 0 {
+                    if header == "\r\n" || header == "\n" {
                         break;
                     }
-                    line.clear();
+                    header.clear();
                 }
-                let _ = stream.write_all(
-                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot found",
+                let requested = request.split_whitespace().nth(1).unwrap_or_default();
+                let matched = routes.iter().find(|(path, _, _)| path == requested);
+                let (status, body) = match matched {
+                    Some((_, status, body)) => (*status, body.clone()),
+                    None => (404, b"not found".to_vec()),
+                };
+                let reason = if status == 200 { "OK" } else { "Not Found" };
+                let head = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
                 );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body);
                 let _ = stream.flush();
             }
         });
-        Self {
-            url: format!("http://{address}"),
-            counter,
-        }
+        Self { url, counter, stop }
+    }
+
+    /// Stop answering, so that a later request cannot silently succeed.
+    fn stop(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(self.url.trim_start_matches("http://"));
     }
 
     fn requests(&self) -> usize {
