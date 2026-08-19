@@ -30,7 +30,7 @@ cargo install \
   --locked
 ```
 
-The repository is currently developing v0.2.0-alpha.1. The stable installation
+The repository is currently developing v0.3.0-alpha.1. The stable installation
 above remains v0.1.2; the alpha has not been published.
 
 ### Install locally
@@ -446,7 +446,7 @@ no host or user names, no nondeterministic iteration order.
 ```jsonc
 {
   "schemaVersion": 1,
-  "concordVersion": "0.2.0-alpha.1",
+  "concordVersion": "0.3.0-alpha.1",
   "configuration": {              // only what affects results
     "mode": "lint",
     "baselineTool": "eslint",

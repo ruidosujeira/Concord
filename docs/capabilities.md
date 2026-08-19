@@ -1,6 +1,6 @@
 # Capabilities and comparison plans
 
-Concord v0.2 classifies every globally discovered path independently for the
+Concord v0.3 classifies every globally discovered path independently for the
 baseline and candidate before running a comparison.
 
 - `supported`: the adapter has explicit built-in evidence for the file type.

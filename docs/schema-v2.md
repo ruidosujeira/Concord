@@ -1,6 +1,6 @@
 # JSON report schema 2
 
-Every report produced by Concord v0.2.0-alpha.1 has:
+Every report produced by Concord v0.3.0-alpha.1 has:
 
 ```json
 {"schemaVersion": 2}
