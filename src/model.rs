@@ -227,7 +227,10 @@ pub fn normalize_path(root: &Path, input: &Path) -> String {
     let comparable_absolute = comparable_path(&absolute);
     let relative = comparable_absolute
         .strip_prefix(&comparable_root)
-        .unwrap_or(&comparable_absolute);
+        .map(Path::to_path_buf)
+        .ok()
+        .or_else(|| canonical_relative_path(root, &absolute))
+        .unwrap_or(comparable_absolute);
     let mut parts: Vec<String> = Vec::new();
     for component in relative.components() {
         match component {
@@ -251,6 +254,24 @@ pub fn normalize_path(root: &Path, input: &Path) -> String {
     } else {
         parts.join("/")
     }
+}
+
+/// Windows can expose the same existing path through different lexical
+/// spellings (for example a short user-profile name versus its expanded
+/// canonical name). Keep the common path purely lexical, but retry with both
+/// sides canonicalized when that comparison fails.
+#[cfg(windows)]
+fn canonical_relative_path(root: &Path, absolute: &Path) -> Option<PathBuf> {
+    let root = std::fs::canonicalize(root).ok()?;
+    let absolute = std::fs::canonicalize(absolute).ok()?;
+    let root = comparable_path(&root);
+    let absolute = comparable_path(&absolute);
+    absolute.strip_prefix(root).ok().map(Path::to_path_buf)
+}
+
+#[cfg(not(windows))]
+fn canonical_relative_path(_root: &Path, _absolute: &Path) -> Option<PathBuf> {
+    None
 }
 
 #[cfg(windows)]
@@ -329,5 +350,18 @@ mod tests {
             ),
             "src/app.ts"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_file_is_relative_to_the_original_temporary_root() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_directory = directory.path().join("src");
+        std::fs::create_dir(&source_directory).expect("source directory");
+        let source = source_directory.join("app.ts");
+        std::fs::write(&source, "export {};\n").expect("source file");
+
+        let canonical = std::fs::canonicalize(source).expect("canonical source");
+        assert_eq!(normalize_path(directory.path(), &canonical), "src/app.ts");
     }
 }

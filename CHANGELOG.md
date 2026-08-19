@@ -46,8 +46,8 @@ All notable changes to Concord are documented here.
 - Isolated corpus tool processes from entry-owned native configuration and
   working directories; only configuration explicitly trusted in the invoking
   `concord.toml` may be loaded.
-- Normalized Windows verbatim drive and UNC paths before relativizing report
-  paths.
+- Normalized Windows verbatim drive and UNC paths, including alternate lexical
+  spellings of the project root, before relativizing report paths.
 - Restored the declared Rust 1.85 MSRV by pinning the last compatible `ignore`
   release and checking the MSRV in CI.
 
