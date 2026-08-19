@@ -219,7 +219,15 @@ pub fn normalize_path(root: &Path, input: &Path) -> String {
     } else {
         root.join(input)
     };
-    let relative = absolute.strip_prefix(root).unwrap_or(&absolute);
+    // `canonicalize` returns verbatim (`\\?\`) paths on Windows while a
+    // caller's project root is commonly a regular drive or UNC path. They
+    // identify the same location, but `Path::strip_prefix` treats their prefix
+    // components as different unless both are put in the same representation.
+    let comparable_root = comparable_path(root);
+    let comparable_absolute = comparable_path(&absolute);
+    let relative = comparable_absolute
+        .strip_prefix(&comparable_root)
+        .unwrap_or(&comparable_absolute);
     let mut parts: Vec<String> = Vec::new();
     for component in relative.components() {
         match component {
@@ -245,6 +253,33 @@ pub fn normalize_path(root: &Path, input: &Path) -> String {
     }
 }
 
+#[cfg(windows)]
+fn comparable_path(path: &Path) -> PathBuf {
+    let rendered = path.as_os_str().to_string_lossy();
+    strip_windows_verbatim_prefix(&rendered)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+#[cfg(not(windows))]
+fn comparable_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+#[cfg(any(windows, test))]
+fn strip_windows_verbatim_prefix(path: &str) -> Option<String> {
+    if let Some(path) = path.strip_prefix(r"\\?\UNC\") {
+        return Some(format!(r"\\{path}"));
+    }
+    if let Some(path) = path.strip_prefix(r"\\?\") {
+        return Some(path.to_owned());
+    }
+    if let Some(path) = path.strip_prefix("//?/UNC/") {
+        return Some(format!("//{path}"));
+    }
+    path.strip_prefix("//?/").map(ToOwned::to_owned)
+}
+
 pub fn path_from_report(root: &Path, report_path: &str) -> PathBuf {
     let normalized = report_path.replace('/', std::path::MAIN_SEPARATOR_STR);
     root.join(normalized)
@@ -252,7 +287,7 @@ pub fn path_from_report(root: &Path, report_path: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_path;
+    use super::{normalize_path, strip_windows_verbatim_prefix};
     use std::path::Path;
 
     #[test]
@@ -260,6 +295,38 @@ mod tests {
         let root = Path::new("/project");
         assert_eq!(
             normalize_path(root, Path::new("/project/src/./nested/../app.ts")),
+            "src/app.ts"
+        );
+    }
+
+    #[test]
+    fn windows_verbatim_drive_and_unc_prefixes_are_removed() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\C:\project\src\app.ts").as_deref(),
+            Some(r"C:\project\src\app.ts")
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\UNC\server\share\src\app.ts").as_deref(),
+            Some(r"\\server\share\src\app.ts")
+        );
+        assert_eq!(strip_windows_verbatim_prefix(r"C:\project"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_windows_input_is_relative_to_a_regular_root() {
+        assert_eq!(
+            normalize_path(
+                Path::new(r"C:\project"),
+                Path::new(r"\\?\C:\project\src\app.ts")
+            ),
+            "src/app.ts"
+        );
+        assert_eq!(
+            normalize_path(
+                Path::new(r"\\server\share\project"),
+                Path::new(r"\\?\UNC\server\share\project\src\app.ts")
+            ),
             "src/app.ts"
         );
     }

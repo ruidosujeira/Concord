@@ -8,8 +8,9 @@
 //! Corpus entries are untrusted. Nothing acquired here is executed: the two
 //! tool executables are resolved once against the invocation's own project
 //! root and pinned as absolute paths, so an entry that ships its own
-//! `node_modules/.bin` can never be run, and no project configuration is
-//! evaluated.
+//! `node_modules/.bin` can never be run. Native tool configuration discovery
+//! is also disabled; only configuration explicitly trusted by the invocation
+//! may be loaded.
 
 pub mod acquire;
 pub mod analysis;
@@ -105,7 +106,10 @@ pub fn run(loaded: &LoadedConfig, options: &CorpusOptions) -> Result<CorpusOutco
         eprintln!("warning: {warning}");
     }
     let cache = Cache::open(options.cache_dir.as_deref())?;
-    let config = pinned_config(loaded, options)?;
+    // Keep the generated safe configurations alive for every tool process in
+    // this run, including any later reduction pass.
+    let pinned = pinned_config(loaded, options)?;
+    let config = pinned.config.clone();
     let capabilities = CapabilityCatalog::new(&config)?;
 
     let key = state::key(&manifest, options, &config);
@@ -407,21 +411,112 @@ fn validate(options: &CorpusOptions) -> Result<()> {
     Ok(())
 }
 
-/// Resolve both tools once, against the invocation's own project root, and pin
-/// them as absolute commands. Nothing inside a corpus entry is ever resolved.
-fn pinned_config(loaded: &LoadedConfig, options: &CorpusOptions) -> Result<Config> {
+/// Configuration pinned to the invocation, plus the directory that owns any
+/// generated inert native-tool configurations.
+struct PinnedConfig {
+    config: Config,
+    _safe_config_directory: tempfile::TempDir,
+}
+
+/// Resolve both tools once against the invocation's own project root, pin them
+/// as absolute commands, and prevent native configuration discovery inside a
+/// corpus entry.
+fn pinned_config(loaded: &LoadedConfig, options: &CorpusOptions) -> Result<PinnedConfig> {
     let runner = ProcessRunner::new(loaded.root.clone(), loaded.config.clone(), None);
     let mut config = loaded.config.clone();
+    let safe_config_directory = tempfile::Builder::new()
+        .prefix("concord-corpus-config-")
+        .tempdir()
+        .map_err(|error| {
+            ConcordError::run_failure(format!(
+                "failed to create isolated corpus tool configuration: {error}"
+            ))
+        })?;
     for tool in [options.baseline, options.candidate] {
         let resolved = runner.resolve(tool).map_err(|error| {
             ConcordError::run_failure(format!(
                 "{tool} must be available to run a corpus comparison\n{error}"
             ))
         })?;
-        tool_config_mut(&mut config, tool).command =
-            Some(resolved.executable.to_string_lossy().into_owned());
+
+        let trusted_configuration = tool_config_mut(&mut config, tool).config.clone();
+        let trusted_configuration = trusted_configuration
+            .map(|configured| {
+                let configured = Path::new(&configured);
+                let configured = if configured.is_absolute() {
+                    configured.to_path_buf()
+                } else {
+                    loaded.root.join(configured)
+                };
+                let canonical = std::fs::canonicalize(&configured).map_err(|error| {
+                    ConcordError::run_failure(format!(
+                        "the trusted {} configuration could not be read\npath: {}\nerror: {error}",
+                        tool.config_key(),
+                        configured.display()
+                    ))
+                })?;
+                if !canonical.is_file() {
+                    return Err(ConcordError::run_failure(format!(
+                        "the trusted {} configuration is not a file\npath: {}",
+                        tool.config_key(),
+                        configured.display()
+                    )));
+                }
+                Ok(canonical)
+            })
+            .transpose()?;
+        let isolated_configuration = if trusted_configuration.is_none() {
+            safe_configuration(tool, safe_config_directory.path())?
+        } else {
+            None
+        };
+
+        let tool_config = tool_config_mut(&mut config, tool);
+        tool_config.command = Some(resolved.executable.to_string_lossy().into_owned());
+        tool_config.config = trusted_configuration
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        tool_config.isolate_project_configuration = true;
+        tool_config.isolated_config = isolated_configuration;
+        tool_config.isolated_working_directory = Some(safe_config_directory.path().to_path_buf());
     }
-    Ok(config)
+    Ok(PinnedConfig {
+        config,
+        _safe_config_directory: safe_config_directory,
+    })
+}
+
+/// ESLint and Prettier have an explicit no-config mode. The other tools need
+/// an inert root configuration to stop discovery while remaining usable.
+fn safe_configuration(tool: Tool, directory: &Path) -> Result<Option<PathBuf>> {
+    let (name, contents) = match tool {
+        Tool::Biome => ("biome.json", "{}\n"),
+        Tool::Oxlint => (".oxlintrc.json", "{}\n"),
+        // Pin every option that Oxfmt may otherwise inherit from an entry's
+        // `.editorconfig` as well as disabling nested native configurations.
+        Tool::Oxfmt => (
+            ".oxfmtrc.json",
+            concat!(
+                "{\n",
+                "  \"endOfLine\": \"lf\",\n",
+                "  \"insertFinalNewline\": true,\n",
+                "  \"printWidth\": 100,\n",
+                "  \"tabWidth\": 2,\n",
+                "  \"useTabs\": false\n",
+                "}\n"
+            ),
+        ),
+        Tool::Eslint | Tool::Prettier => return Ok(None),
+    };
+    let path = directory.join(name);
+    std::fs::write(&path, contents).map_err(|error| {
+        ConcordError::run_failure(format!(
+            "failed to write isolated {} configuration\npath: {}\nerror: {error}",
+            tool.config_key(),
+            path.display()
+        ))
+    })?;
+    Ok(Some(path))
 }
 
 fn tool_config_mut(config: &mut Config, tool: Tool) -> &mut ToolConfig {

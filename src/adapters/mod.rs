@@ -57,7 +57,13 @@ pub fn run_linter(
     let version = runner
         .version(&resolved)
         .unwrap_or_else(|error| format!("unknown ({error})"));
-    let arguments = lint_arguments(tool, runner.root(), files);
+    let arguments = lint_arguments(
+        tool,
+        runner.root(),
+        files,
+        runner.isolates_project_configuration(tool),
+        runner.tool_configuration(tool).as_deref(),
+    );
     let argument_strings = arguments
         .iter()
         .map(|argument| argument.to_string_lossy().into_owned())
@@ -163,7 +169,12 @@ impl FormatterAdapter {
     }
 
     pub fn run(&self, path: &Path, input: &[u8], normalize_eol: bool) -> FormatterOutcome {
-        let arguments = formatter_arguments(self.tool(), path);
+        let arguments = formatter_arguments(
+            self.tool(),
+            path,
+            self.runner.isolates_project_configuration(self.tool()),
+            self.runner.tool_configuration(self.tool()).as_deref(),
+        );
         let argument_strings = arguments
             .iter()
             .map(|argument| argument.to_string_lossy().into_owned())
@@ -358,7 +369,13 @@ fn classify_format(
     }
 }
 
-fn lint_arguments(tool: Tool, root: &Path, files: &[PathBuf]) -> Vec<OsString> {
+fn lint_arguments(
+    tool: Tool,
+    root: &Path,
+    files: &[PathBuf],
+    isolate: bool,
+    configuration: Option<&Path>,
+) -> Vec<OsString> {
     let mut arguments: Vec<OsString> = match tool {
         Tool::Eslint => ["--format", "json"]
             .into_iter()
@@ -380,21 +397,65 @@ fn lint_arguments(tool: Tool, root: &Path, files: &[PathBuf]) -> Vec<OsString> {
             .collect(),
         _ => Vec::new(),
     };
+    append_configuration_arguments(&mut arguments, tool, isolate, configuration);
     arguments.extend(files.iter().map(|path| {
-        path.strip_prefix(root)
-            .unwrap_or(path)
-            .as_os_str()
-            .to_owned()
+        if isolate {
+            path.as_os_str().to_owned()
+        } else {
+            path.strip_prefix(root)
+                .unwrap_or(path)
+                .as_os_str()
+                .to_owned()
+        }
     }));
     arguments
 }
 
-fn formatter_arguments(tool: Tool, path: &Path) -> Vec<OsString> {
-    match tool {
+fn formatter_arguments(
+    tool: Tool,
+    path: &Path,
+    isolate: bool,
+    configuration: Option<&Path>,
+) -> Vec<OsString> {
+    let mut arguments = match tool {
         Tool::Prettier => prettier::arguments(path),
         Tool::Biome => biome_format::arguments(path),
         Tool::Oxfmt => oxfmt::arguments(path),
         _ => Vec::new(),
+    };
+    append_configuration_arguments(&mut arguments, tool, isolate, configuration);
+    arguments
+}
+
+fn append_configuration_arguments(
+    arguments: &mut Vec<OsString>,
+    tool: Tool,
+    isolate: bool,
+    configuration: Option<&Path>,
+) {
+    if let Some(configuration) = configuration {
+        let flag = match tool {
+            Tool::Biome => "--config-path=",
+            _ => "--config=",
+        };
+        let mut argument = OsString::from(flag);
+        argument.push(configuration);
+        arguments.push(argument);
+    } else if isolate {
+        match tool {
+            Tool::Eslint => arguments.push(OsString::from("--no-config-lookup")),
+            Tool::Prettier => arguments.push(OsString::from("--no-config")),
+            _ => {}
+        }
+    }
+    if isolate {
+        match tool {
+            Tool::Prettier => arguments.push(OsString::from("--no-editorconfig")),
+            Tool::Oxlint | Tool::Oxfmt => {
+                arguments.push(OsString::from("--disable-nested-config"));
+            }
+            _ => {}
+        }
     }
 }
 
@@ -513,16 +574,20 @@ fn normalized_eol(value: &str, enabled: bool) -> String {
 mod tests {
     use std::path::Path;
 
-    use super::lint_arguments;
+    use super::{formatter_arguments, lint_arguments};
     use crate::model::Tool;
+
+    fn rendered(arguments: Vec<std::ffi::OsString>) -> Vec<String> {
+        arguments
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect()
+    }
 
     #[test]
     fn biome_uses_structured_json_without_diagnostic_limit() {
-        let arguments = lint_arguments(Tool::Biome, Path::new("/project"), &[]);
-        let arguments: Vec<_> = arguments
-            .iter()
-            .map(|argument| argument.to_string_lossy())
-            .collect();
+        let arguments = lint_arguments(Tool::Biome, Path::new("/project"), &[], false, None);
+        let arguments = rendered(arguments);
         assert!(
             arguments
                 .iter()
@@ -537,6 +602,69 @@ mod tests {
             arguments
                 .iter()
                 .all(|argument| argument != "--reporter=rdjson")
+        );
+    }
+
+    #[test]
+    fn isolated_linters_cannot_discover_entry_configuration() {
+        let root = Path::new("/project");
+        let trusted = Path::new("/trusted/config.json");
+
+        let eslint = rendered(lint_arguments(Tool::Eslint, root, &[], true, None));
+        assert!(
+            eslint
+                .iter()
+                .any(|argument| argument == "--no-config-lookup")
+        );
+
+        let biome = rendered(lint_arguments(Tool::Biome, root, &[], true, Some(trusted)));
+        assert!(
+            biome
+                .iter()
+                .any(|argument| argument == &format!("--config-path={}", trusted.display()))
+        );
+
+        let oxlint = rendered(lint_arguments(Tool::Oxlint, root, &[], true, Some(trusted)));
+        assert!(
+            oxlint
+                .iter()
+                .any(|argument| argument == &format!("--config={}", trusted.display()))
+        );
+        assert!(
+            oxlint
+                .iter()
+                .any(|argument| argument == "--disable-nested-config")
+        );
+    }
+
+    #[test]
+    fn isolated_formatters_cannot_discover_entry_configuration() {
+        let source = Path::new("/project/source.ts");
+        let trusted = Path::new("/trusted/config.json");
+
+        let prettier = rendered(formatter_arguments(Tool::Prettier, source, true, None));
+        assert!(prettier.iter().any(|argument| argument == "--no-config"));
+        assert!(
+            prettier
+                .iter()
+                .any(|argument| argument == "--no-editorconfig")
+        );
+
+        let oxfmt = rendered(formatter_arguments(
+            Tool::Oxfmt,
+            source,
+            true,
+            Some(trusted),
+        ));
+        assert!(
+            oxfmt
+                .iter()
+                .any(|argument| argument == &format!("--config={}", trusted.display()))
+        );
+        assert!(
+            oxfmt
+                .iter()
+                .any(|argument| argument == "--disable-nested-config")
         );
     }
 }

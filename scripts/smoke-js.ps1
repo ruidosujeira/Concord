@@ -46,6 +46,14 @@ export default [{
     @'
 version = 1
 
+[discovery]
+exclude = [
+  "**/eslint.config.*",
+  "**/biome.json",
+  "**/prettier.config.*",
+  "**/oxfmt.config.*",
+]
+
 [[matching.rules]]
 baseline_tool = "eslint"
 baseline = "no-debugger"
@@ -66,6 +74,29 @@ console.log(value)
 debugger
 // DIFF
 '@ | Set-Content src/case.js
+    New-Item -ItemType Directory -Path corpus-entry/src -Force | Out-Null
+    @'
+this is not valid JavaScript configuration
+'@ | Set-Content corpus-entry/eslint.config.js
+    @'
+{ this is not valid JSON configuration
+'@ | Set-Content corpus-entry/biome.json
+    @'
+this is not valid JavaScript configuration
+'@ | Set-Content corpus-entry/prettier.config.js
+    @'
+this is not valid TypeScript configuration
+'@ | Set-Content corpus-entry/oxfmt.config.ts
+    @'
+[*]
+indent_size = 9
+'@ | Set-Content corpus-entry/.editorconfig
+    @'
+const value = 1;
+'@ | Set-Content corpus-entry/src/case.js
+    @'
+path:corpus-entry
+'@ | Set-Content corpus.txt
 
     & cargo run --quiet --manifest-path "$RepoRoot/Cargo.toml" -- doctor
     & cargo run --quiet --manifest-path "$RepoRoot/Cargo.toml" -- plan lint --baseline eslint --candidate biome --no-save-report src
@@ -76,6 +107,10 @@ debugger
     Invoke-Comparison @("compare", "format", "--baseline", "prettier", "--candidate", "oxfmt", "--unsupported-policy", "ignore", "--no-save-report", "src", "package-lock.json")
     Assert-ExitCode 1 @("compare", "format", "--baseline", "prettier", "--candidate", "oxfmt", "--unsupported-policy", "difference", "--no-save-report", "package-lock.json")
     Assert-ExitCode 3 @("compare", "format", "--baseline", "prettier", "--candidate", "oxfmt", "--unsupported-policy", "error", "--no-save-report", "package-lock.json")
+    Invoke-Comparison @("corpus", "--mode", "lint", "--baseline", "eslint", "--candidate", "biome", "--cache-dir", "corpus-cache", "--no-resume", "--quiet", "corpus.txt")
+    Invoke-Comparison @("corpus", "--mode", "lint", "--baseline", "eslint", "--candidate", "oxlint", "--cache-dir", "corpus-cache", "--no-resume", "--quiet", "corpus.txt")
+    Invoke-Comparison @("corpus", "--mode", "format", "--baseline", "prettier", "--candidate", "biome", "--cache-dir", "corpus-cache", "--no-resume", "--quiet", "corpus.txt")
+    Invoke-Comparison @("corpus", "--mode", "format", "--baseline", "prettier", "--candidate", "oxfmt", "--cache-dir", "corpus-cache", "--no-resume", "--quiet", "corpus.txt")
     Invoke-Comparison @("compare", "lint", "--baseline", "eslint", "--candidate", "biome", "--profile", "comparable", "--report-file", "reports/concord report.json", "src")
     & cargo run --quiet --manifest-path "$RepoRoot/Cargo.toml" -- plan lint --baseline eslint --candidate biome --report-file reports/plan-first.json src
     & cargo run --quiet --manifest-path "$RepoRoot/Cargo.toml" -- plan lint --baseline eslint --candidate biome --report-file reports/plan-second.json src

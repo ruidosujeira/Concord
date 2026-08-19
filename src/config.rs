@@ -23,6 +23,7 @@ formatter_jobs = 4
 # Uncomment a command to select an explicit executable.
 # [tools.eslint]
 # command = "/path/to/eslint"
+# config = "/path/to/eslint.config.js"
 # include = ["**/*.js", "**/*.ts"]
 # exclude = ["**/generated/**"]
 # unsupported = []
@@ -158,9 +159,23 @@ impl ToolsConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ToolConfig {
     pub command: Option<String>,
+    /// Native tool configuration. Relative paths are resolved from the
+    /// project root containing `concord.toml`.
+    pub config: Option<String>,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
     pub unsupported: Vec<String>,
+    /// Internal corpus-only switch. Never accepted from or written to TOML.
+    #[serde(skip)]
+    pub isolate_project_configuration: bool,
+    /// Generated safe configuration used when an isolated tool has no trusted
+    /// native configuration. Never enters reports or resume keys.
+    #[serde(skip)]
+    pub isolated_config: Option<PathBuf>,
+    /// Corpus-only working directory used to keep incidental configuration
+    /// lookup away from an acquired entry.
+    #[serde(skip)]
+    pub isolated_working_directory: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -397,6 +412,10 @@ mod tests {
         assert!(config.tools.eslint.include.is_empty());
         assert!(config.tools.eslint.exclude.is_empty());
         assert!(config.tools.eslint.unsupported.is_empty());
+        assert!(config.tools.eslint.config.is_none());
+        assert!(!config.tools.eslint.isolate_project_configuration);
+        assert!(config.tools.eslint.isolated_config.is_none());
+        assert!(config.tools.eslint.isolated_working_directory.is_none());
         assert!(config.matching.rules.is_empty());
         assert_eq!(
             config.comparison.unsupported,

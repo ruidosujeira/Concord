@@ -166,6 +166,82 @@ fn help_documents_every_flag() {
 }
 
 #[test]
+fn native_tool_configuration_is_isolated_from_corpus_entries() {
+    let directory = workspace(&["eslint", "biome", "prettier", "oxfmt"], &["alpha"]);
+    let path = directory.path();
+    let project = path.join("projects").join("alpha");
+    for (name, contents) in [
+        ("eslint.config.js", "panic('entry eslint config loaded');\n"),
+        ("biome.json", "{ invalid entry biome config\n"),
+        (
+            "prettier.config.js",
+            "panic('entry prettier config loaded');\n",
+        ),
+        ("oxfmt.config.ts", "panic('entry oxfmt config loaded');\n"),
+        (".editorconfig", "[*]\nindent_size = 9\n"),
+    ] {
+        fs::write(project.join(name), contents).expect("entry configuration");
+    }
+    let name = manifest(path, "corpus.txt", "path:projects/alpha\n");
+    let log = path.join("invocations.log");
+    let log_value = log.to_str().expect("log path");
+
+    let lint = lint_run_with_env(
+        path,
+        &["--no-resume", &name],
+        &[("CONCORD_FAKE_INVOCATION_LOG", log_value)],
+    );
+    assert_eq!(lint.status.code(), Some(1), "{}", stderr(&lint));
+
+    let format = corpus_command(
+        path,
+        &[
+            "--mode",
+            "format",
+            "--baseline",
+            "prettier",
+            "--candidate",
+            "oxfmt",
+            "--no-resume",
+            &name,
+        ],
+    )
+    .env("CONCORD_FAKE_INVOCATION_LOG", log_value)
+    .output()
+    .expect("run format corpus");
+    assert_eq!(format.status.code(), Some(0), "{}", stderr(&format));
+
+    let invocations = fs::read_to_string(log).expect("invocation log");
+    let eslint = invocations
+        .lines()
+        .find(|line| line.starts_with("eslint ") && !line.contains("--version"))
+        .expect("eslint invocation");
+    assert!(eslint.contains("--no-config-lookup"), "{eslint}");
+
+    let biome = invocations
+        .lines()
+        .find(|line| line.starts_with("biome ") && line.contains(" lint "))
+        .expect("biome invocation");
+    assert!(biome.contains("--config-path="), "{biome}");
+    assert!(biome.contains("concord-corpus-config-"), "{biome}");
+
+    let prettier = invocations
+        .lines()
+        .find(|line| line.starts_with("prettier ") && !line.contains("--version"))
+        .expect("prettier invocation");
+    assert!(prettier.contains("--no-config"), "{prettier}");
+    assert!(prettier.contains("--no-editorconfig"), "{prettier}");
+
+    let oxfmt = invocations
+        .lines()
+        .find(|line| line.starts_with("oxfmt ") && !line.contains("--version"))
+        .expect("oxfmt invocation");
+    assert!(oxfmt.contains("--config="), "{oxfmt}");
+    assert!(oxfmt.contains("concord-corpus-config-"), "{oxfmt}");
+    assert!(oxfmt.contains("--disable-nested-config"), "{oxfmt}");
+}
+
+#[test]
 fn one_pass_collapses_shared_divergences_and_separates_distinct_ones() {
     let directory = workspace(
         &["eslint", "biome"],

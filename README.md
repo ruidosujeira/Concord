@@ -162,6 +162,7 @@ formatter_jobs = 4
 
 [tools.eslint]
 command = "/project/node_modules/.bin/eslint"
+config = "/project/eslint.config.js"
 include = ["**/*.js", "**/*.ts"]
 exclude = ["**/generated/**"]
 unsupported = ["**/legacy/**"]
@@ -213,6 +214,13 @@ An explicit command is resolved first. Without one, Concord checks
 `node_modules/.bin` at the project root and then `PATH`. Paths containing spaces
 remain one process argument. Timeouts terminate the complete process group (a
 job object on Windows).
+
+Every tool also accepts an optional `config` path. Relative paths are resolved
+from the project that contains `concord.toml` and passed explicitly to the
+native tool. Normal single-project comparisons preserve native configuration
+discovery when this field is absent. JavaScript or TypeScript configuration
+files can execute code in their tool's runtime, so only point `config` at a
+file you trust.
 
 Tool `include` narrows that tool's files, `exclude` produces `skipped`, and
 `unsupported` records an explicit unsupported capability. Empty lists preserve
@@ -343,12 +351,15 @@ Every acquisition is retried twice on transport errors with exponential
 backoff. Integrity failures and 404s are not retried.
 
 Nothing acquired is ever executed. No install script runs, no package manager
-is invoked, no build step happens, and no project configuration is evaluated
-as code. Both tool executables are resolved once against the invocation's own
-project root and pinned as absolute commands, so an entry that ships its own
-`node_modules/.bin` can never be run. A corpus run uses one configuration —
-the `concord.toml` resolved for the invocation — and never reads configuration
-from inside an entry.
+is invoked, and no build step happens. Both tool executables are resolved once
+against the invocation's own project root and pinned as absolute commands, so
+an entry that ships its own `node_modules/.bin` can never be run. Native tool
+configuration discovery runs from an isolated directory, never from the
+entry. If `tools.<name>.config` is set in the invocation's `concord.toml`, that
+trusted file is pinned and passed explicitly; otherwise Concord uses the
+tool's no-config mode or a generated inert configuration. A JavaScript or
+TypeScript configuration explicitly supplied this way remains executable and
+must be trusted.
 
 ### Fingerprints
 
@@ -580,6 +591,7 @@ run-level failures with `2` and partial failures with `3`; see
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
+cargo +1.85.0 check --locked --all-targets --all-features
 cargo run -- --help
 cargo run -- init --help
 cargo run -- compare lint --help

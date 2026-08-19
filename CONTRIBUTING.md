@@ -21,6 +21,7 @@ secrets or machine-specific absolute paths in fixtures.
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
+cargo +1.85.0 check --locked --all-targets --all-features
 cargo run -- --help
 ```
 
