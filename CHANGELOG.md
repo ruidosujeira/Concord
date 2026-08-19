@@ -22,6 +22,8 @@ All notable changes to Concord are documented here.
 - Added capability-aware comparison planning.
 - Added `unsupported`, `skipped`, and `failed` as distinct outcomes.
 - Added per-tool include, exclude, and unsupported file patterns.
+- Added an optional per-tool `config` path for explicitly selected native tool
+  configuration.
 - Added explicit rule mappings with exact and approximate confidence.
 - Added raw and comparable lint summaries.
 - Added the `concord plan` command.
@@ -38,6 +40,16 @@ All notable changes to Concord are documented here.
 - Approximate rule mappings can no longer produce exact matches.
 - Formatter failures no longer include known unsupported files.
 - The report schema was upgraded from version 1 to version 2.
+
+### Fixed
+
+- Isolated corpus tool processes from entry-owned native configuration and
+  working directories; only configuration explicitly trusted in the invoking
+  `concord.toml` may be loaded.
+- Normalized Windows verbatim drive and UNC paths before relativizing report
+  paths.
+- Restored the declared Rust 1.85 MSRV by pinning the last compatible `ignore`
+  release and checking the MSRV in CI.
 
 ### Deprecated
 

@@ -36,6 +36,14 @@ EOF
 cat >concord.toml <<'EOF'
 version = 1
 
+[discovery]
+exclude = [
+  "**/eslint.config.*",
+  "**/biome.json",
+  "**/prettier.config.*",
+  "**/oxfmt.config.*",
+]
+
 [[matching.rules]]
 baseline_tool = "eslint"
 baseline = "no-debugger"
@@ -55,6 +63,30 @@ const value={answer:42}
 console.log(value)
 debugger
 // DIFF
+EOF
+
+mkdir -p corpus-entry/src
+cat >corpus-entry/eslint.config.js <<'EOF'
+this is not valid JavaScript configuration
+EOF
+cat >corpus-entry/biome.json <<'EOF'
+{ this is not valid JSON configuration
+EOF
+cat >corpus-entry/prettier.config.js <<'EOF'
+this is not valid JavaScript configuration
+EOF
+cat >corpus-entry/oxfmt.config.ts <<'EOF'
+this is not valid TypeScript configuration
+EOF
+cat >corpus-entry/.editorconfig <<'EOF'
+[*]
+indent_size = 9
+EOF
+cat >corpus-entry/src/case.js <<'EOF'
+const value = 1;
+EOF
+cat >corpus.txt <<'EOF'
+path:corpus-entry
 EOF
 
 run_comparison() {
@@ -89,6 +121,10 @@ run_comparison compare format --baseline prettier --candidate biome --no-save-re
 run_comparison compare format --baseline prettier --candidate oxfmt --unsupported-policy ignore --no-save-report src package-lock.json
 expect_status 1 compare format --baseline prettier --candidate oxfmt --unsupported-policy difference --no-save-report package-lock.json
 expect_status 3 compare format --baseline prettier --candidate oxfmt --unsupported-policy error --no-save-report package-lock.json
+run_comparison corpus --mode lint --baseline eslint --candidate biome --cache-dir corpus-cache --no-resume --quiet corpus.txt
+run_comparison corpus --mode lint --baseline eslint --candidate oxlint --cache-dir corpus-cache --no-resume --quiet corpus.txt
+run_comparison corpus --mode format --baseline prettier --candidate biome --cache-dir corpus-cache --no-resume --quiet corpus.txt
+run_comparison corpus --mode format --baseline prettier --candidate oxfmt --cache-dir corpus-cache --no-resume --quiet corpus.txt
 
 run_comparison compare lint --baseline eslint --candidate biome --profile comparable --report-file "reports/concord report.json" src
 cargo run --quiet --manifest-path "$repo_root/Cargo.toml" -- plan lint --baseline eslint --candidate biome --report-file reports/plan-first.json src

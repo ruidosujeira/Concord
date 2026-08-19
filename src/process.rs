@@ -52,6 +52,34 @@ impl ProcessRunner {
         &self.root
     }
 
+    pub fn isolates_project_configuration(&self, tool: Tool) -> bool {
+        self.config.tools.get(tool).isolate_project_configuration
+    }
+
+    pub fn tool_configuration(&self, tool: Tool) -> Option<PathBuf> {
+        let configured = self.config.tools.get(tool);
+        if let Some(path) = &configured.isolated_config {
+            return Some(path.clone());
+        }
+        configured.config.as_deref().map(|path| {
+            let path = Path::new(path);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                self.root.join(path)
+            }
+        })
+    }
+
+    fn working_directory(&self, tool: Tool) -> &Path {
+        self.config
+            .tools
+            .get(tool)
+            .isolated_working_directory
+            .as_deref()
+            .unwrap_or(&self.root)
+    }
+
     pub fn resolve(&self, tool: Tool) -> ToolResult<ResolvedTool> {
         let configured = self.config.tools.get(tool).command.as_deref();
         let mut checked = Vec::new();
@@ -156,7 +184,7 @@ impl ProcessRunner {
         let mut command = Command::new(&resolved.executable);
         command
             .args(&arguments)
-            .current_dir(&self.root)
+            .current_dir(self.working_directory(resolved.tool))
             .stdin(if stdin.is_some() {
                 Stdio::piped()
             } else {
