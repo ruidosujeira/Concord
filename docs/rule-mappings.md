@@ -52,4 +52,4 @@ warning: matching.aliases is deprecated; use matching.rules
 ```
 
 Aliases are deprecated because they cannot represent confidence or notes.
-They will continue to work throughout the v0.2 alpha compatibility period.
+They will continue to work throughout the v0.3 alpha compatibility period.
